@@ -343,7 +343,7 @@ if __name__ == "__main__":
         in_channels      = IN_CHANNELS,
     )
 
-    wandb.init(entity="ram-algoverse", project="wildfire-flow", config=cfg)
+    wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config=cfg)
 
     # ---- Data ----
     print(f"Loading data (IN_CHANNELS={IN_CHANNELS})...")

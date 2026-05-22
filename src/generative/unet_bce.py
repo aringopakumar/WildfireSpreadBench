@@ -342,7 +342,7 @@ if __name__ == "__main__":
 
     wandb.init(
         entity  = "ram-algoverse",
-        project = "wildfire-flow",
+        project = "WildfireSpreadBench",
         config  = cfg,
     )
 

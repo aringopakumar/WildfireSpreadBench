@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    wandb.init(entity="ram-algoverse", project="wildfire-flow", config={
+    wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config={
         "task": "evaluation",
         "model": "DDPM (Unet, cond_ch=6, model_ch=128, CFG)",
     })
