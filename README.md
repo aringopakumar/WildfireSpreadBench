@@ -1,3 +1,44 @@
+# WildfireSpreadBench
+
+Benchmark comparing generative and discriminative models for
+wildfire spread prediction, built on WildfireSpreadTS.
+
+**Models:**
+- Discriminative: ResNet18 U-Net (SMP), ConvLSTM, UTAE, Logistic Regression, Persistence
+- Generative: DDPM, Flow Matching, BCE U-Net
+
+**Feature sets:** Vegetation | Multi | All (matching WildfireSpreadTS Table 5)
+
+## Running discriminative baselines
+These run exactly as in the original WildfireSpreadTS paper:
+
+    python src/train.py \
+      --config cfgs/unet/res18_monotemporal.yaml \
+      --trainer cfgs/trainer_single_gpu.yaml \
+      --data cfgs/data_monotemporal_full_features.yaml \
+      --trainer.max_epochs=200 \
+      --do_test=True \
+      --data.data_dir YOUR_DATA_DIR
+
+## Running generative models
+
+    python src/train_generative.py \
+      --model [unet_bce|flow|ddpm] \
+      --data_dir YOUR_DATA_DIR \
+      --ckpt_dir YOUR_CKPT_DIR \
+      --feature_set [vegetation|multi|all] \
+      --epochs 200 \
+      --eval_every 10
+
+## Data preparation
+Convert raw .tif files to HDF5 format first:
+
+    python src/preprocess/CreateHDF5Dataset.py \
+      --data_dir /path/to/raw/tifs \
+      --target_dir /path/to/hdf5/output
+
+---
+
 # WildfireSpreadTS: A dataset of multi-modal time series for wildfire spread prediction
 
 This repository contains the code for recreating the experiments in the WildfireSpreadTS paper. 

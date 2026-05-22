@@ -5,7 +5,6 @@ import rasterio
 from torch.utils.data import Dataset
 import torch
 import numpy as np
-from torch.utils.data.dataset import T_co
 import glob
 import warnings
 from .utils import get_means_stds_missing_values, get_indices_of_degree_features
