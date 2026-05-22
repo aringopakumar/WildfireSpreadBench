@@ -61,6 +61,9 @@ class MyLightningCLI(LightningCLI):
 
     @rank_zero_only
     def wandb_setup(self):
+        if wandb.run is None:
+            return
+
         """
         Save the config used by LightningCLI to disk, then save that file to wandb.
         Using wandb.config adds some strange formating that means we'd have to do some 
@@ -82,6 +85,8 @@ class MyLightningCLI(LightningCLI):
 
 
 def main():
+    os.environ["WANDB_PROJECT"] = "WildfireSpreadBench"
+    os.environ["WANDB_ENTITY"] = "ram-algoverse"
 
     # LightningCLI automatically creates an argparse parser with required arguments and types,
     # and instantiates the model and datamodule. For this, it's important to import the model and datamodule classes above.
