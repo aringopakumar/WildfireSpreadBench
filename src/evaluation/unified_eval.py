@@ -267,3 +267,59 @@ def evaluate_ddpm(model, diffusion, eval_loader, device, epoch=None, wandb_log=T
         epoch=epoch,
         wandb_log=wandb_log,
     )
+
+
+# ---------------------------------------------------------------------------
+# Lightning model evaluation (discriminative baselines)
+# ---------------------------------------------------------------------------
+
+def evaluate_lightning_model(
+    model,
+    datamodule,
+    device,
+    model_name: str,
+    wandb_log: bool = True,
+) -> dict:
+    """
+    Evaluate a PyTorch Lightning BaseModel subclass through the unified harness.
+
+    This gives discriminative models (SMPModel, ConvLSTM, UTAE, etc.) identical
+    metric computation to generative models, enabling apples-to-apples comparison.
+
+    Parameters
+    ----------
+    model : BaseModel subclass, already loaded with weights.
+    datamodule : FireSpreadDataModule, already configured.
+    device : torch.device
+    model_name : str
+        Used in W&B keys, e.g. "SMPModel", "ConvLSTMLightning".
+    wandb_log : bool
+        Whether to push metrics to the active W&B run.
+
+    Returns
+    -------
+    dict with keys: ap, f1, precision, recall, iou
+    """
+    model.to(device)
+    model.eval()
+
+    datamodule.setup("test")
+    test_loader = datamodule.test_dataloader()
+
+    def predict_fn(x0):
+        # x0 arrives as [B, T, C, H, W] from FireSpreadDataset
+        x0 = x0[:, 0, :, :, :]   # [B, C, H, W]
+        logits = model(x0)        # BaseModel.forward returns logits
+        prob = torch.sigmoid(logits)
+        if prob.dim() == 3:
+            prob = prob.unsqueeze(1)  # ensure [B, 1, H, W]
+        return prob
+
+    return evaluate_model(
+        predict_fn=predict_fn,
+        eval_loader=test_loader,
+        device=device,
+        model_name=model_name,
+        epoch=None,
+        wandb_log=wandb_log,
+    )

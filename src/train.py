@@ -105,6 +105,20 @@ def main():
     if cli.config.do_test:
         cli.trainer.test(cli.model, cli.datamodule, ckpt_path=ckpt)
 
+        # Unified eval pass — identical metric computation to generative models
+        from evaluation.unified_eval import evaluate_lightning_model
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_name = cli.config.model.class_path.split(".")[-1]
+
+        evaluate_lightning_model(
+            model=cli.model.to(device),
+            datamodule=cli.datamodule,
+            device=device,
+            model_name=model_name,
+            wandb_log=True,
+        )
+
     if cli.config.do_predict:
 
         # Produce predictions, save them in a single file, including ground truth fire targets and input fire masks.
