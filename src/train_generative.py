@@ -5,11 +5,16 @@ Single entry point for training all generative models.
 
 Usage:
   python src/train_generative.py --model unet_bce --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
-  python src/train_generative.py --model flow --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
-  python src/train_generative.py --model ddpm --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
+  python src/train_generative.py --model flow    --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
+  python src/train_generative.py --model ddpm    --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
+
+Note: each child module exposes a `main(args)` function. This dispatcher parses
+the shared CLI and calls it directly, rather than relying on the child's
+`__main__` block (which does not run on import).
 """
 
-import argparse, sys
+import argparse
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -23,22 +28,15 @@ def main():
     parser.add_argument("--eval_every",  type=int, default=10)
     args = parser.parse_args()
 
-    # Build sys.argv for the child module's argparse
-    sys.argv = [
-        args.model,
-        "--data_dir",    args.data_dir,
-        "--ckpt_dir",    args.ckpt_dir,
-        "--feature_set", args.feature_set,
-        "--epochs",      str(args.epochs),
-        "--eval_every",  str(args.eval_every),
-    ]
-
     if args.model == "unet_bce":
-        import src.generative.unet_bce as m
+        from src.generative.unet_bce import main as run
     elif args.model == "flow":
-        import src.generative.flow_matching as m
+        from src.generative.flow_matching import main as run
     elif args.model == "ddpm":
-        import src.generative.ddpm.training_script as m
+        from src.generative.ddpm.training_script import main as run
+
+    run(args)
+
 
 if __name__ == "__main__":
     main()
