@@ -10,6 +10,22 @@ Patches vs. previous version
 - Dataset year tuples corrected to WildfireSpreadTS fold 0:
   train = [2018, 2019], test = [2021], stats_years = [2018, 2019].
 
+Fixes for the over-prediction / blob collapse (precision ~0.014, recall ~0.89)
+-----------------------------------------------------------------------------
+1. SYMMETRIC LOSS. The old loss weighted only *target* fire pixels (1 + 49*x1),
+   punishing under-prediction of fire 50x but over-prediction 1x. That biased
+   the velocity field positive; 50 Euler steps amplified the bias into blobs.
+   New loss weights the *active region* (fire in either frame -- the perimeter
+   where spread happens) symmetrically, regardless of the sign of the error.
+2. TARGET SMOOTHING. x1 is lightly Gaussian-blurred for the training target so
+   v* = x1_smooth - x0_fire is a continuous field rather than sparse +/-1 steps.
+   Evaluation/thresholding still uses the hard mask.
+3. FEWER INTEGRATION STEPS. The field is near-linear; default n_steps lowered
+   50 -> 8 to curb error accumulation during Euler integration.
+4. FIELD DIAGNOSTICS. integrate_flow can report mean predicted velocity and the
+   active-pixel fraction at t=0, logged to wandb -- a direct read on whether the
+   field is still biased, rather than inferring it from downstream precision.
+
 Architecture: VectorFieldNet learns a velocity field mapping current fire
 state x0_fire toward next-day fire state x1 along the straight-line path
 x_t = (1-t) x0_fire + t x1, with target velocity v* = x1 - x0_fire.
@@ -17,7 +33,7 @@ x_t = (1-t) x0_fire + t x1, with target velocity v* = x1 - x0_fire.
 Reference: Lipman et al., "Flow Matching for Generative Modeling" (2022).
 """
 
-import os, sys, argparse, time, torch
+import os, sys, argparse, time, math, torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -146,39 +162,101 @@ class VectorFieldNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Target smoothing
+# ---------------------------------------------------------------------------
+def _gaussian_kernel1d(sigma, device, dtype):
+    """1D Gaussian kernel; radius = ceil(3*sigma)."""
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    xs = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    k = torch.exp(-(xs ** 2) / (2.0 * sigma * sigma))
+    return k / k.sum()
+
+
+def smooth_mask(x, sigma):
+    """Separable Gaussian blur on a (B,1,H,W) mask. sigma<=0 is a no-op."""
+    if sigma is None or sigma <= 0:
+        return x
+    k = _gaussian_kernel1d(sigma, x.device, x.dtype)
+    pad = (k.numel() - 1) // 2
+    kx = k.view(1, 1, 1, -1)
+    ky = k.view(1, 1, -1, 1)
+    x = F.conv2d(F.pad(x, (pad, pad, 0, 0), mode="reflect"), kx)
+    x = F.conv2d(F.pad(x, (0, 0, pad, pad), mode="reflect"), ky)
+    return x
+
+
+# ---------------------------------------------------------------------------
 # Loss / inference / viz
 # ---------------------------------------------------------------------------
-def flow_matching_loss(model, x0, x1, pos_weight_value=50.0):
-    """Weighted MSE on the predicted velocity field v* = x1 - x0_fire."""
+def flow_matching_loss(model, x0, x1, active_weight=5.0, target_smooth_sigma=1.0):
+    """Symmetric weighted MSE on the predicted velocity field.
+
+    Fix vs. the old version: the weight no longer depends on the *target* fire
+    pixels alone (which biased the field positive). Instead it up-weights the
+    *active region* -- pixels that are fire in either the current frame or the
+    next frame, i.e. the perimeter where spread happens -- and applies that
+    weight symmetrically to the squared error regardless of the sign of the
+    error. Over-predicting fire is penalized exactly as hard as missing it.
+
+    The target is optionally Gaussian-smoothed so v* is a continuous field
+    rather than sparse +/-1 spikes. Evaluation/thresholding uses the hard mask.
+    """
     B, device = x0.shape[0], x0.device
     x0_fire   = x0[:, :1]
+
+    # Smoothed regression target; hard mask used only to define the active region.
+    x1_target = smooth_mask(x1, target_smooth_sigma)
+
     t   = torch.rand(B, device=device)
     t_b = t.view(B, 1, 1, 1)
-    x_t      = (1 - t_b) * x0_fire + t_b * x1
-    target_v = x1 - x0_fire
-    pred_v     = model(x_t, x0, t)
-    weight_map = 1.0 + (pos_weight_value - 1.0) * x1
+    x_t      = (1 - t_b) * x0_fire + t_b * x1_target
+    target_v = x1_target - x0_fire
+    pred_v   = model(x_t, x0, t)
+
+    # Active region = fire in either frame (hard masks), dilated slightly by the
+    # same smoothing so the perimeter is covered. Symmetric in the error sign.
+    active = smooth_mask(torch.clamp(x0_fire + x1, 0.0, 1.0), target_smooth_sigma)
+    active = (active > 1e-4).float()
+    weight_map = 1.0 + (active_weight - 1.0) * active
+
     return (weight_map * (pred_v - target_v) ** 2).mean()
 
 
 @torch.no_grad()
-def integrate_flow(model, x0, n_steps=50, threshold=0.5, device="cpu"):
-    """Euler integration of the velocity field from t=0 to t=1."""
+def integrate_flow(model, x0, n_steps=8, threshold=0.5, device="cpu", return_diag=False):
+    """Euler integration of the velocity field from t=0 to t=1.
+
+    Default n_steps lowered 50 -> 8: the field is near-linear, and fewer steps
+    curb the error accumulation that previously drove runaway over-prediction.
+    """
     model.eval()
     x0 = x0.to(device)
     x  = x0[:, :1].clone()
     dt = 1.0 / n_steps
+
+    diag = None
     for i in range(n_steps):
         t_val = i * dt
         t     = torch.full((x.shape[0],), t_val, device=device)
         v     = model(x, x0, t)
-        x     = x + dt * v
+        if i == 0 and return_diag:
+            # Honest-field probes at t=0: a positive mean velocity or an
+            # active fraction far above the fire base rate => field still biased.
+            diag = {
+                "diag/mean_velocity":    v.mean().item(),
+                "diag/abs_mean_velocity": v.abs().mean().item(),
+                "diag/active_frac_t0":   (v.abs() > 0.05).float().mean().item(),
+            }
+        x = x + dt * v
     prob   = torch.clamp(x, 0.0, 1.0)
     binary = (prob >= threshold).float()
+    if return_diag:
+        return binary, prob, diag
     return binary, prob
 
 
-def visualize_predictions(model, eval_loader, device, ckpt_dir, epoch=None, num_examples=4):
+def visualize_predictions(model, eval_loader, device, ckpt_dir, n_steps=8,
+                          epoch=None, num_examples=4):
     import matplotlib.pyplot as plt
     tag = f"epoch_{epoch}" if epoch is not None else "final"
     model.eval()
@@ -193,7 +271,7 @@ def visualize_predictions(model, eval_loader, device, ckpt_dir, epoch=None, num_
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)
             x1 = y.unsqueeze(1).float().to(device)
-            _, pred_prob = integrate_flow(model, x0, n_steps=50, device=device)
+            _, pred_prob = integrate_flow(model, x0, n_steps=n_steps, device=device)
             axes[i, 0].imshow(x0[0, 0].cpu().numpy(),        cmap="gray", vmin=0, vmax=1)
             axes[i, 1].imshow(pred_prob[0, 0].cpu().numpy(), cmap="gray", vmin=0, vmax=1)
             axes[i, 2].imshow(x1[0, 0].cpu().numpy(),        cmap="gray", vmin=0, vmax=1)
@@ -207,6 +285,31 @@ def visualize_predictions(model, eval_loader, device, ckpt_dir, epoch=None, num_
     print(f"Saved prediction visualization to {save_path}")
 
 
+@torch.no_grad()
+def log_field_diagnostics(model, eval_loader, device, n_steps, epoch, max_batches=32):
+    """Average the t=0 field probes over a slice of the eval set and log them."""
+    model.eval()
+    acc = {}
+    n = 0
+    for i, batch in enumerate(eval_loader):
+        if i >= max_batches:
+            break
+        x, _ = batch
+        x0 = x[:, 0, :, :, :].to(device)
+        _, _, diag = integrate_flow(model, x0, n_steps=n_steps, device=device,
+                                    return_diag=True)
+        for k, v in diag.items():
+            acc[k] = acc.get(k, 0.0) + v
+        n += 1
+    if n:
+        log = {k: v / n for k, v in acc.items()}
+        log["epoch"] = epoch
+        wandb.log(log)
+        print("Field diagnostics: " +
+              ", ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in log.items()
+                        if k != "epoch"))
+
+
 # ---------------------------------------------------------------------------
 # Training entry point
 # ---------------------------------------------------------------------------
@@ -218,17 +321,18 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = dict(
-        architecture      = "VectorFieldNet (base_channels=128, t_dim=256)",
-        loss              = "Weighted MSE on velocity field",
-        epochs            = args.epochs,
-        batch_size        = 16,
-        learning_rate     = 1e-4,
-        weight_decay      = 1e-4,
-        pos_weight_value  = 50.0,
-        n_steps_inference = 50,
-        feature_set       = args.feature_set,
-        in_channels       = in_channels,
-        fold              = "fold0 (train 2018+2019, test 2021)",
+        architecture        = "VectorFieldNet (base_channels=128, t_dim=256)",
+        loss                = "Symmetric active-region weighted MSE on velocity field",
+        epochs              = args.epochs,
+        batch_size          = 16,
+        learning_rate       = 1e-4,
+        weight_decay        = 1e-4,
+        active_weight       = args.active_weight,
+        target_smooth_sigma = args.target_smooth_sigma,
+        n_steps_inference   = args.n_steps,
+        feature_set         = args.feature_set,
+        in_channels         = in_channels,
+        fold                = "fold0 (train 2018+2019, test 2021)",
     )
 
     wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config=cfg)
@@ -284,7 +388,9 @@ def main(args):
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)
             x1 = y.unsqueeze(1).float().to(device)
-            loss = flow_matching_loss(model, x0, x1, pos_weight_value=cfg["pos_weight_value"])
+            loss = flow_matching_loss(model, x0, x1,
+                                      active_weight=cfg["active_weight"],
+                                      target_smooth_sigma=cfg["target_smooth_sigma"])
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -308,21 +414,25 @@ def main(args):
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             def predict_fn(x0):
                 x0 = x0[:, 0, :, :, :]
-                _, prob = integrate_flow(model, x0, n_steps=50, device=device)
+                _, prob = integrate_flow(model, x0, n_steps=args.n_steps, device=device)
                 return prob
             evaluate_model(predict_fn, eval_loader, device,
                            model_name="FlowMatching", epoch=epoch, wandb_log=True)
-            visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir, epoch=epoch)
+            log_field_diagnostics(model, eval_loader, device, args.n_steps, epoch)
+            visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir,
+                                  n_steps=args.n_steps, epoch=epoch)
             model.train()
 
     print("\nTraining complete. Running final evaluation...")
     def predict_fn(x0):
         x0 = x0[:, 0, :, :, :]
-        _, prob = integrate_flow(model, x0, n_steps=50, device=device)
+        _, prob = integrate_flow(model, x0, n_steps=args.n_steps, device=device)
         return prob
     evaluate_model(predict_fn, eval_loader, device,
                    model_name="FlowMatching", epoch=None, wandb_log=True)
-    visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir)
+    log_field_diagnostics(model, eval_loader, device, args.n_steps, epoch=None)
+    visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir,
+                          n_steps=args.n_steps)
     torch.save(model.state_dict(), os.path.join(args.ckpt_dir, "wildfire_flow_best.pt"))
     wandb.finish()
 
@@ -335,4 +445,10 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--feature_set", type=str, default="vegetation",
                         choices=["vegetation", "multi", "all"])
+    parser.add_argument("--active_weight", type=float, default=5.0,
+                        help="Symmetric weight on the active (perimeter) region.")
+    parser.add_argument("--target_smooth_sigma", type=float, default=1.0,
+                        help="Gaussian sigma for smoothing the velocity target. 0 disables.")
+    parser.add_argument("--n_steps", type=int, default=8,
+                        help="Euler integration steps at inference.")
     main(parser.parse_args())
