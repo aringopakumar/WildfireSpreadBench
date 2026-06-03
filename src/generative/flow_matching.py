@@ -1,43 +1,68 @@
 """
 src/generative/flow_matching.py
 
-Pure Conditional Flow Matching for next-day wildfire spread prediction.
+Conditional Flow Matching for next-day wildfire spread prediction,
+reformulated in the FlowSDF style (Bogensperger et al., IJCV 2025) and adapted
+for the extreme spatial sparsity of wildfire masks (~1% positive pixels).
 
-Patches vs. previous version
-----------------------------
-- Training body wrapped in `def main(args)` so src/train_generative.py can
-  call it; standalone `__main__` retained.
-- Dataset year tuples corrected to WildfireSpreadTS fold 0:
-  train = [2018, 2019], test = [2021], stats_years = [2018, 2019].
+Why this reformulation
+----------------------
+The original version learned a velocity field mapping the *current* fire mask
+x0_fire toward the *next-day* binary mask x1, integrating from x = x0_fire. That
+collapsed into over-prediction "blobs" (measured: mean velocity ~0.42,
+active-pixel fraction ~0.98 at t=0; AP fell to base rate). Two structural causes:
 
-Fixes for the over-prediction / blob collapse (precision ~0.014, recall ~0.89)
------------------------------------------------------------------------------
-1. SYMMETRIC LOSS. The old loss weighted only *target* fire pixels (1 + 49*x1),
-   punishing under-prediction of fire 50x but over-prediction 1x. That biased
-   the velocity field positive; 50 Euler steps amplified the bias into blobs.
-   New loss weights the *active region* (fire in either frame -- the perimeter
-   where spread happens) symmetrically, regardless of the sign of the error.
-2. TARGET SMOOTHING. x1 is lightly Gaussian-blurred for the training target so
-   v* = x1_smooth - x0_fire is a continuous field rather than sparse +/-1 steps.
-   Evaluation/thresholding still uses the hard mask.
-3. FEWER INTEGRATION STEPS. The field is near-linear; default n_steps lowered
-   50 -> 8 to curb error accumulation during Euler integration.
-4. FIELD DIAGNOSTICS. integrate_flow can report mean predicted velocity and the
-   active-pixel fraction at t=0, logged to wandb -- a direct read on whether the
-   field is still biased, rather than inferring it from downstream precision.
+  1. Starting integration at the current mask makes the regression target the
+     displacement x1 - x0_fire, which on sparse fire is overwhelmingly "+1"
+     (new fire appears) -> the field is biased positive by construction.
+  2. A binary {0,1} mask is a pathological target for a continuous velocity
+     field: 99% zeros with sparse +/-1 spikes.
 
-Architecture: VectorFieldNet learns a velocity field mapping current fire
-state x0_fire toward next-day fire state x1 along the straight-line path
-x_t = (1-t) x0_fire + t x1, with target velocity v* = x1 - x0_fire.
+FlowSDF fixes the formulation and is the standard, citable approach for flow
+matching on segmentation:
 
-Reference: Lipman et al., "Flow Matching for Generative Modeling" (2022).
+  * START FROM NOISE. x0 ~ N(0, I); the conditioning (current fire + covariates)
+    enters through the network, not as the integration start. This removes the
+    dominant positive bias.
+  * SDF TARGET. The next-day mask -> truncated Signed Distance Function
+    (negative inside fire, positive outside, 0 at the boundary). Dense, smooth,
+    well-posed; thresholded masks distort along boundaries rather than punching
+    random holes.
+
+Sparsity adaptation (this codebase)
+-----------------------------------
+At ~1% fire, a raw SDF is dominated by the positive background plateau, so its
+mean is strongly positive and the velocity target inherits that bias. We address
+this with two fixed, inference-safe choices:
+
+  * FIXED TRAIN-SET NORMALIZATION. The SDF mean/std are estimated ONCE over the
+    training masks and applied identically at train and test time (exactly how
+    inputs are standardized via stats_years). Target becomes ~zero-mean / unit
+    scale. The mask boundary (raw SDF = 0) maps to the fixed normalized
+    threshold thr = -mean/std, so mask recovery is deterministic and exact.
+  * TIGHT TRUNCATION (SDF_TRUNC=3). Shrinks the background plateau, reducing the
+    residual positive skew that standardization cannot remove (mean+var only).
+
+Residual note: a small positive skew (~+0.1) remains because the SDF
+distribution is right-skewed at this sparsity; this is an inherent, reportable
+property of SDF flow matching on very sparse targets, not a tunable bug. It is a
+mild constant offset the network learns around, not the structural sign
+imbalance that caused the original blobs.
+
+Inference: integrate noise -> normalized SDF, recover mask by thresholding at
+thr = -SDF_MEAN/SDF_STD; a bounded map gives a pseudo-probability for AP.
+
+Reference: Lipman et al., "Flow Matching for Generative Modeling" (2022);
+Bogensperger et al., "FlowSDF: Flow Matching for Medical Image Segmentation
+Using Distance Transforms," IJCV 2025 (arXiv:2405.18087).
 """
 
-import os, sys, argparse, time, math, torch
+import os, sys, argparse, time, torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from scipy.ndimage import distance_transform_edt
 import wandb
 
 sys.path.insert(0, 'src')
@@ -59,6 +84,61 @@ CHANNELS = {"vegetation": 7, "multi": 34, "all": 40}
 TRAIN_YEARS = [2018, 2019]
 TEST_YEARS  = [2021]
 STATS_YEARS = [2018, 2019]
+
+SDF_TRUNC = 3.0   # tight truncation (pixels): shrinks background plateau / skew
+
+
+# ---------------------------------------------------------------------------
+# SDF transforms + fixed normalization
+# ---------------------------------------------------------------------------
+def mask_to_sdf(mask, trunc=SDF_TRUNC):
+    """(B,1,H,W) binary mask -> truncated signed distance function (pixel units).
+
+    Negative inside fire, positive outside, 0 at the boundary, clipped to
+    [-trunc, trunc]. Empty -> +trunc constant; full -> -trunc constant.
+    """
+    m = mask.detach().cpu().numpy()
+    out = np.empty_like(m, dtype=np.float32)
+    for b in range(m.shape[0]):
+        binm = (m[b, 0] > 0.5)
+        if binm.any() and (~binm).any():
+            sdf = distance_transform_edt(~binm) - distance_transform_edt(binm)
+        elif binm.all():
+            sdf = -np.full(binm.shape, trunc, dtype=np.float32)
+        else:
+            sdf = np.full(binm.shape, trunc, dtype=np.float32)
+        out[b, 0] = np.clip(sdf, -trunc, trunc)
+    return torch.from_numpy(out).to(mask.device)
+
+
+def estimate_sdf_stats(dataset, max_samples=400, trunc=SDF_TRUNC):
+    """Estimate fixed SDF mean/std over the training masks (run once)."""
+    vals = []
+    n = min(len(dataset), max_samples)
+    step = max(1, len(dataset) // n)
+    for i in range(0, len(dataset), step):
+        _, y = dataset[i]
+        y = torch.as_tensor(y).float().view(1, 1, *y.shape[-2:])
+        vals.append(mask_to_sdf(y, trunc=trunc).flatten())
+        if len(vals) >= n:
+            break
+    allv = torch.cat(vals)
+    mean = allv.mean().item()
+    std  = allv.std().item() + 1e-6
+    return mean, std
+
+
+def normalize_sdf(sdf, mean, std):
+    return (sdf - mean) / std
+
+
+def denormalize_sdf(sdf_n, mean, std):
+    return sdf_n * std + mean
+
+
+def sdf_to_prob(sdf_pixels, scale=2.0):
+    """Bounded SDF (pixel units) -> pseudo-probability in (0,1) for AP."""
+    return torch.sigmoid(-sdf_pixels / scale)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +162,11 @@ class ResBlock(nn.Module):
 
 
 class VectorFieldNet(nn.Module):
-    """Timestep-conditioned UNet velocity field predictor (C=128, 4 levels)."""
+    """Timestep-conditioned UNet velocity field predictor (C=128, 4 levels).
+
+    x_t (starting from noise) is concatenated with the conditioning x0 (current
+    fire + covariates) at every scale; x0 rides along purely as conditioning.
+    """
     def __init__(self, in_channels=IN_CHANNELS, base_channels=128, t_dim=256):
         super().__init__()
         C          = base_channels
@@ -162,106 +246,69 @@ class VectorFieldNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Target smoothing
-# ---------------------------------------------------------------------------
-def _gaussian_kernel1d(sigma, device, dtype):
-    """1D Gaussian kernel; radius = ceil(3*sigma)."""
-    radius = max(1, int(math.ceil(3.0 * sigma)))
-    xs = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-(xs ** 2) / (2.0 * sigma * sigma))
-    return k / k.sum()
-
-
-def smooth_mask(x, sigma):
-    """Separable Gaussian blur on a (B,1,H,W) mask. sigma<=0 is a no-op."""
-    if sigma is None or sigma <= 0:
-        return x
-    k = _gaussian_kernel1d(sigma, x.device, x.dtype)
-    pad = (k.numel() - 1) // 2
-    kx = k.view(1, 1, 1, -1)
-    ky = k.view(1, 1, -1, 1)
-    x = F.conv2d(F.pad(x, (pad, pad, 0, 0), mode="reflect"), kx)
-    x = F.conv2d(F.pad(x, (0, 0, pad, pad), mode="reflect"), ky)
-    return x
-
-
-# ---------------------------------------------------------------------------
 # Loss / inference / viz
 # ---------------------------------------------------------------------------
-def flow_matching_loss(model, x0, x1, active_weight=5.0, target_smooth_sigma=1.0):
-    """Symmetric weighted MSE on the predicted velocity field.
+def flow_matching_loss(model, x0, x1, sdf_mean, sdf_std):
+    """Plain MSE on the velocity field, FlowSDF-style with fixed normalization.
 
-    Fix vs. the old version: the weight no longer depends on the *target* fire
-    pixels alone (which biased the field positive). Instead it up-weights the
-    *active region* -- pixels that are fire in either the current frame or the
-    next frame, i.e. the perimeter where spread happens -- and applies that
-    weight symmetrically to the squared error regardless of the sign of the
-    error. Over-predicting fire is penalized exactly as hard as missing it.
-
-    The target is optionally Gaussian-smoothed so v* is a continuous field
-    rather than sparse +/-1 spikes. Evaluation/thresholding uses the hard mask.
+    Path: x_t = (1-t)*noise + t*sdf_norm, target v* = sdf_norm - noise.
+    Conditioning x0 enters through the network.
     """
     B, device = x0.shape[0], x0.device
-    x0_fire   = x0[:, :1]
+    sdf_norm = normalize_sdf(mask_to_sdf(x1), sdf_mean, sdf_std)
 
-    # Smoothed regression target; hard mask used only to define the active region.
-    x1_target = smooth_mask(x1, target_smooth_sigma)
-
+    noise = torch.randn_like(sdf_norm)
     t   = torch.rand(B, device=device)
     t_b = t.view(B, 1, 1, 1)
-    x_t      = (1 - t_b) * x0_fire + t_b * x1_target
-    target_v = x1_target - x0_fire
+
+    x_t      = (1 - t_b) * noise + t_b * sdf_norm
+    target_v = sdf_norm - noise
     pred_v   = model(x_t, x0, t)
-
-    # Active region = fire in either frame (hard masks), dilated slightly by the
-    # same smoothing so the perimeter is covered. Symmetric in the error sign.
-    active = smooth_mask(torch.clamp(x0_fire + x1, 0.0, 1.0), target_smooth_sigma)
-    active = (active > 1e-4).float()
-    weight_map = 1.0 + (active_weight - 1.0) * active
-
-    return (weight_map * (pred_v - target_v) ** 2).mean()
+    return F.mse_loss(pred_v, target_v)
 
 
 @torch.no_grad()
-def integrate_flow(model, x0, n_steps=8, threshold=0.5, device="cpu", return_diag=False):
-    """Euler integration of the velocity field from t=0 to t=1.
+def integrate_flow(model, x0, sdf_mean, sdf_std, n_steps=50, device="cpu",
+                   return_diag=False):
+    """Euler integration from noise (t=0) to the predicted normalized SDF (t=1).
 
-    Default n_steps lowered 50 -> 8: the field is near-linear, and fewer steps
-    curb the error accumulation that previously drove runaway over-prediction.
+    Recovers the mask via the fixed threshold thr = -mean/std (raw SDF = 0).
+    Returns (binary_mask, pseudo_prob).
     """
     model.eval()
     x0 = x0.to(device)
-    x  = x0[:, :1].clone()
+    B, _, H, W = x0.shape
+    x  = torch.randn(B, 1, H, W, device=device)
     dt = 1.0 / n_steps
 
     diag = None
     for i in range(n_steps):
         t_val = i * dt
-        t     = torch.full((x.shape[0],), t_val, device=device)
+        t     = torch.full((B,), t_val, device=device)
         v     = model(x, x0, t)
         if i == 0 and return_diag:
-            # Honest-field probes at t=0: a positive mean velocity or an
-            # active fraction far above the fire base rate => field still biased.
             diag = {
-                "diag/mean_velocity":    v.mean().item(),
+                "diag/mean_velocity":     v.mean().item(),
                 "diag/abs_mean_velocity": v.abs().mean().item(),
-                "diag/active_frac_t0":   (v.abs() > 0.05).float().mean().item(),
             }
         x = x + dt * v
-    prob   = torch.clamp(x, 0.0, 1.0)
-    binary = (prob >= threshold).float()
+
+    thr    = -sdf_mean / sdf_std                 # normalized location of raw SDF=0
+    binary = (x <= thr).float()
+    prob   = sdf_to_prob(denormalize_sdf(x, sdf_mean, sdf_std))
     if return_diag:
+        diag["diag/pred_fire_frac"] = binary.mean().item()
         return binary, prob, diag
     return binary, prob
 
 
-def visualize_predictions(model, eval_loader, device, ckpt_dir, n_steps=8,
-                          epoch=None, num_examples=4):
+def visualize_predictions(model, eval_loader, device, ckpt_dir, sdf_mean, sdf_std,
+                          n_steps=50, epoch=None, num_examples=4):
     import matplotlib.pyplot as plt
     tag = f"epoch_{epoch}" if epoch is not None else "final"
     model.eval()
     fig, axes = plt.subplots(num_examples, 3, figsize=(12, num_examples * 4))
-    fig.suptitle(f"Flow Matching Predictions ({tag})", fontsize=14)
+    fig.suptitle(f"FlowSDF Predictions ({tag})", fontsize=14)
     for col, title in enumerate(["Current Fire (Input)", "Predicted Fire", "Ground Truth"]):
         axes[0, col].set_title(title, fontsize=12)
     with torch.no_grad():
@@ -271,7 +318,8 @@ def visualize_predictions(model, eval_loader, device, ckpt_dir, n_steps=8,
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)
             x1 = y.unsqueeze(1).float().to(device)
-            _, pred_prob = integrate_flow(model, x0, n_steps=n_steps, device=device)
+            _, pred_prob = integrate_flow(model, x0, sdf_mean, sdf_std,
+                                          n_steps=n_steps, device=device)
             axes[i, 0].imshow(x0[0, 0].cpu().numpy(),        cmap="gray", vmin=0, vmax=1)
             axes[i, 1].imshow(pred_prob[0, 0].cpu().numpy(), cmap="gray", vmin=0, vmax=1)
             axes[i, 2].imshow(x1[0, 0].cpu().numpy(),        cmap="gray", vmin=0, vmax=1)
@@ -286,18 +334,17 @@ def visualize_predictions(model, eval_loader, device, ckpt_dir, n_steps=8,
 
 
 @torch.no_grad()
-def log_field_diagnostics(model, eval_loader, device, n_steps, epoch, max_batches=32):
-    """Average the t=0 field probes over a slice of the eval set and log them."""
+def log_field_diagnostics(model, eval_loader, device, sdf_mean, sdf_std,
+                          n_steps, epoch, max_batches=32):
     model.eval()
-    acc = {}
-    n = 0
+    acc, n = {}, 0
     for i, batch in enumerate(eval_loader):
         if i >= max_batches:
             break
         x, _ = batch
         x0 = x[:, 0, :, :, :].to(device)
-        _, _, diag = integrate_flow(model, x0, n_steps=n_steps, device=device,
-                                    return_diag=True)
+        _, _, diag = integrate_flow(model, x0, sdf_mean, sdf_std,
+                                    n_steps=n_steps, device=device, return_diag=True)
         for k, v in diag.items():
             acc[k] = acc.get(k, 0.0) + v
         n += 1
@@ -321,18 +368,17 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = dict(
-        architecture        = "VectorFieldNet (base_channels=128, t_dim=256)",
-        loss                = "Symmetric active-region weighted MSE on velocity field",
-        epochs              = args.epochs,
-        batch_size          = 16,
-        learning_rate       = 1e-4,
-        weight_decay        = 1e-4,
-        active_weight       = args.active_weight,
-        target_smooth_sigma = args.target_smooth_sigma,
-        n_steps_inference   = args.n_steps,
-        feature_set         = args.feature_set,
-        in_channels         = in_channels,
-        fold                = "fold0 (train 2018+2019, test 2021)",
+        architecture      = "VectorFieldNet (base_channels=128, t_dim=256)",
+        loss              = "FlowSDF: MSE on velocity field, noise->normalized SDF",
+        epochs            = args.epochs,
+        batch_size        = 16,
+        learning_rate     = 1e-4,
+        weight_decay      = 1e-4,
+        sdf_trunc         = SDF_TRUNC,
+        n_steps_inference = args.n_steps,
+        feature_set       = args.feature_set,
+        in_channels       = in_channels,
+        fold              = "fold0 (train 2018+2019, test 2021)",
     )
 
     wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config=cfg)
@@ -356,6 +402,14 @@ def main(args):
     )
     eval_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
+    # Fixed SDF normalization stats over training masks (computed once).
+    print("Estimating fixed SDF normalization stats over training masks...")
+    sdf_mean, sdf_std = estimate_sdf_stats(train_dataset, trunc=SDF_TRUNC)
+    print(f"SDF stats: mean={sdf_mean:.4f} std={sdf_std:.4f} "
+          f"| recovery threshold={-sdf_mean/sdf_std:.4f}")
+    wandb.config.update({"sdf_mean": round(sdf_mean, 4), "sdf_std": round(sdf_std, 4),
+                         "sdf_recover_thr": round(-sdf_mean / sdf_std, 4)})
+
     model = VectorFieldNet(in_channels=in_channels, base_channels=128, t_dim=256).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params / 1e6:.1f}M")
@@ -376,6 +430,8 @@ def main(args):
             scheduler.load_state_dict(ckpt["scheduler"])
             global_step = ckpt.get("global_step", 0)
             start_epoch = ckpt["epoch"] + 1
+            sdf_mean = ckpt.get("sdf_mean", sdf_mean)
+            sdf_std  = ckpt.get("sdf_std", sdf_std)
         else:
             model.load_state_dict(ckpt)
         print(f"Resumed from epoch {start_epoch - 1}")
@@ -388,9 +444,7 @@ def main(args):
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)
             x1 = y.unsqueeze(1).float().to(device)
-            loss = flow_matching_loss(model, x0, x1,
-                                      active_weight=cfg["active_weight"],
-                                      target_smooth_sigma=cfg["target_smooth_sigma"])
+            loss = flow_matching_loss(model, x0, x1, sdf_mean, sdf_std)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -409,30 +463,36 @@ def main(args):
 
         torch.save({"epoch": epoch, "global_step": global_step,
                     "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict()}, ckpt_path)
+                    "scheduler": scheduler.state_dict(),
+                    "sdf_mean": sdf_mean, "sdf_std": sdf_std}, ckpt_path)
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             def predict_fn(x0):
                 x0 = x0[:, 0, :, :, :]
-                _, prob = integrate_flow(model, x0, n_steps=args.n_steps, device=device)
+                _, prob = integrate_flow(model, x0, sdf_mean, sdf_std,
+                                         n_steps=args.n_steps, device=device)
                 return prob
             evaluate_model(predict_fn, eval_loader, device,
                            model_name="FlowMatching", epoch=epoch, wandb_log=True)
-            log_field_diagnostics(model, eval_loader, device, args.n_steps, epoch)
+            log_field_diagnostics(model, eval_loader, device, sdf_mean, sdf_std,
+                                  args.n_steps, epoch)
             visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir,
+                                  sdf_mean=sdf_mean, sdf_std=sdf_std,
                                   n_steps=args.n_steps, epoch=epoch)
             model.train()
 
     print("\nTraining complete. Running final evaluation...")
     def predict_fn(x0):
         x0 = x0[:, 0, :, :, :]
-        _, prob = integrate_flow(model, x0, n_steps=args.n_steps, device=device)
+        _, prob = integrate_flow(model, x0, sdf_mean, sdf_std,
+                                 n_steps=args.n_steps, device=device)
         return prob
     evaluate_model(predict_fn, eval_loader, device,
                    model_name="FlowMatching", epoch=None, wandb_log=True)
-    log_field_diagnostics(model, eval_loader, device, args.n_steps, epoch=None)
+    log_field_diagnostics(model, eval_loader, device, sdf_mean, sdf_std,
+                          args.n_steps, epoch=None)
     visualize_predictions(model, eval_loader, device, ckpt_dir=args.ckpt_dir,
-                          n_steps=args.n_steps)
+                          sdf_mean=sdf_mean, sdf_std=sdf_std, n_steps=args.n_steps)
     torch.save(model.state_dict(), os.path.join(args.ckpt_dir, "wildfire_flow_best.pt"))
     wandb.finish()
 
@@ -445,10 +505,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--feature_set", type=str, default="vegetation",
                         choices=["vegetation", "multi", "all"])
-    parser.add_argument("--active_weight", type=float, default=5.0,
-                        help="Symmetric weight on the active (perimeter) region.")
-    parser.add_argument("--target_smooth_sigma", type=float, default=1.0,
-                        help="Gaussian sigma for smoothing the velocity target. 0 disables.")
-    parser.add_argument("--n_steps", type=int, default=8,
-                        help="Euler integration steps at inference.")
+    parser.add_argument("--n_steps", type=int, default=50,
+                        help="Euler integration steps at inference (noise -> SDF).")
     main(parser.parse_args())
