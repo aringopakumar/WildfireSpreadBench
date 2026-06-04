@@ -4,6 +4,24 @@ https://github.com/tatakai1/classifier_free_ddim,
 
 Diffusion model is based on "CLASSIFIER-FREE DIFFUSION GUIDANCE"
 https://arxiv.org/abs/2207.12598,
+
+Patch (data-range correctness)
+------------------------------
+Standard DDPM assumes data in [-1, 1]: the forward process and the sampler's
+clip_denoised step both presume a zero-centered [-1, 1] signal. The wildfire
+masks, however, are binary {0, 1} (FireSpreadDataset yields y = (y>0).long(),
+which training casts to float). Training x_start in [0, 1] while the sampler
+clamps reconstructions to [-1, 1] is a train/inference mismatch that
+miscalibrates the output probability map and depresses AP.
+
+Fix: centralize the scaling in this class so no call site can drift.
+  - _scale_in:  [0,1] -> [-1,1], applied to x_start inside train_losses.
+  - _scale_out: [-1,1] -> [0,1], applied when recovering a probability map.
+  - sample_to_prob: runs the reverse process and returns a [0,1] map directly,
+    so training/eval code never hand-rolls recovery (which previously did
+    clamp(0,1) and silently discarded the [-1,0) half of the sampler range).
+The existing clip to [-1, 1] in p_mean_variance is now correct, because the
+model is trained on [-1, 1] data.
 '''
 
 import torch
@@ -74,7 +92,18 @@ class Diffusion:
         self.posterior_mean_coef2 = (
             (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
         )
-    
+
+    # ---- Data-range scaling (centralized; see module docstring) ----
+    @staticmethod
+    def _scale_in(x01):
+        """Binary/[0,1] data -> [-1,1] for the diffusion process."""
+        return x01 * 2.0 - 1.0
+
+    @staticmethod
+    def _scale_out(x_pm1):
+        """[-1,1] sampler output -> [0,1] probability map."""
+        return ((x_pm1 + 1.0) / 2.0).clamp(0.0, 1.0)
+
     # get the param of given timestep t
     def _extract(self, a, t, x_shape):
         batch_size = t.shape[0]
@@ -129,6 +158,7 @@ class Diffusion:
         
         x_recon = self.predict_start_from_noise(x_t, t, pred_noise)
         if clip_denoised:
+            # Correct now that the model is trained on [-1, 1] data.
             x_recon = torch.clamp(x_recon, min=-1., max=1.)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior_mean_variance(x_recon, x_t, t)
         return model_mean, posterior_variance, posterior_log_variance
@@ -148,18 +178,37 @@ class Diffusion:
     
     # denoise : reverse diffusion
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, cond_img, w=2, clip_denoised=True):
+    def p_sample_loop(self, model, shape, cond_img, w=2, clip_denoised=True, progress=True):
         batch_size = shape[0]
         device = next(model.parameters()).device
         
         # start from pure noise
         img = torch.randn(shape, device=device)
         imgs = []
-        for i in tqdm(reversed(range(0, self.timesteps)), desc='sampling loop time step', total=self.timesteps):
+        iterator = reversed(range(0, self.timesteps))
+        if progress:
+            iterator = tqdm(iterator, desc='sampling loop time step', total=self.timesteps)
+        for i in iterator:
             img = self.p_sample(model, img, torch.full((batch_size,), i, device=device, dtype=torch.long), cond_img, w, clip_denoised)
             imgs.append(img.cpu().numpy())
         return imgs
-    
+
+    @torch.no_grad()
+    def sample_to_prob(self, model, cond_img, w=2, clip_denoised=True, progress=False):
+        """Run the reverse process and return a [0,1] probability map [B,1,H,W].
+
+        Single source of truth for inference recovery: the final sampler state
+        lives in [-1,1]; this maps it back to [0,1]. Eval/training code should
+        call this instead of hand-rolling clamp(0,1) on the raw sampler output.
+        """
+        B, _, H, W = cond_img.shape if cond_img.dim() == 4 else (cond_img.shape[0], 1, cond_img.shape[-2], cond_img.shape[-1])
+        device = next(model.parameters()).device
+        shape = (B, 1, H, W)
+        imgs = self.p_sample_loop(model, shape, cond_img, w=w,
+                                  clip_denoised=clip_denoised, progress=progress)
+        final = torch.tensor(np.array(imgs[-1]), device=device)   # [-1,1]
+        return self._scale_out(final)                              # [0,1]
+
     # sample new images
     @torch.no_grad
     def sample(self, model, image_size, cond_img, batch_size=8, channels=1, w=2, clip_denoised=True):
@@ -168,6 +217,8 @@ class Diffusion:
     
     # compute train losses
     def train_losses(self, model, x_start, t, cond_img, mask_c):
+        # Scale binary/[0,1] target into [-1,1] so training matches the sampler.
+        x_start = self._scale_in(x_start)
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise=noise)
         
