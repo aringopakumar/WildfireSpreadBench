@@ -9,7 +9,14 @@ Patches vs. previous version
   call it; standalone `__main__` retained.
 - Dataset year tuples corrected to WildfireSpreadTS fold 0:
   train = [2018, 2019], test = [2021], stats_years = [2018, 2019].
-  (Previous [2018, 2019, 2020] raised KeyError in the stats table.)
+- DATA-RANGE FIX: sampling recovery now goes through diffusion.sample_to_prob,
+  which maps the [-1,1] sampler output back to a [0,1] probability map. The
+  previous code clamped the raw sampler output to [0,1], discarding the [-1,0)
+  half of the range and miscalibrating AP. The matching [0,1]->[-1,1] scaling
+  of the training target lives in diffusion.train_losses. (See diffusion_proc.)
+- Periodic eval can be capped to --eval_samples batches to keep the 1000-step
+  reverse process affordable during training; final eval uses the full set.
+- Classifier-free guidance weight exposed as --guidance_w (logged to config).
 
 Otherwise unchanged: W&B logging, checkpoint resume (model/opt/sched/scaler),
 periodic eval via unified_eval, AMP, cosine LR, classifier-free guidance.
@@ -40,6 +47,18 @@ CHANNELS = {"vegetation": 7, "multi": 34, "all": 40}
 TRAIN_YEARS = [2018, 2019]
 TEST_YEARS  = [2021]
 STATS_YEARS = [2018, 2019]
+
+
+# ---------------------------------------------------------------------------
+# Eval helper: build a DDPM predict_fn that returns a [0,1] prob map.
+# Recovery is centralized in diffusion.sample_to_prob (single source of truth).
+# ---------------------------------------------------------------------------
+def make_ddpm_predict_fn(model, diffusion, device, guidance_w):
+    def predict_fn(x0):
+        x0 = x0[:, 0, :, :, :]                      # [B, T, C, H, W] -> [B, C, H, W]
+        prob = diffusion.sample_to_prob(model, x0, w=guidance_w, progress=False)
+        return prob.to(device)
+    return predict_fn
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +96,7 @@ def train(model, loader, eval_loader, diffusion, device, args):
             optimizer.zero_grad()
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)         # [B, C, H, W]
-            x1 = y.unsqueeze(1).float().to(device)    # [B, 1, H, W]
+            x1 = y.unsqueeze(1).float().to(device)    # [B, 1, H, W] in {0,1}
             images      = x1
             cond_images = x0
 
@@ -85,6 +104,7 @@ def train(model, loader, eval_loader, diffusion, device, args):
             t    = torch.randint(0, 1000, (images.shape[0],), device=device).long()
 
             with torch.amp.autocast("cuda"):
+                # train_losses scales images {0,1} -> [-1,1] internally.
                 loss = diffusion.train_losses(model, images, t, cond_images, mask)
 
             scaler.scale(loss).backward()
@@ -112,22 +132,15 @@ def train(model, loader, eval_loader, diffusion, device, args):
 
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             model.eval()
-            def predict_fn(x0):
-                x0 = x0[:, 0, :, :, :]
-                preds = diffusion.p_sample_loop(model, (x0.shape[0], 1, x0.shape[2], x0.shape[3]), x0)
-                final = np.array(preds[-1])
-                return torch.tensor(final).clamp(0.0, 1.0).to(device)
+            predict_fn = make_ddpm_predict_fn(model, diffusion, device, args.guidance_w)
             evaluate_model(predict_fn, eval_loader, device,
-                           model_name="DDPM", epoch=epoch, wandb_log=True)
+                           model_name="DDPM", epoch=epoch, wandb_log=True,
+                           max_batches=args.eval_samples)
             model.train()
 
-    print("\nTraining complete. Running final evaluation...")
+    print("\nTraining complete. Running final evaluation (full test set)...")
     model.eval()
-    def predict_fn(x0):
-        x0 = x0[:, 0, :, :, :]
-        preds = diffusion.p_sample_loop(model, (x0.shape[0], 1, x0.shape[2], x0.shape[3]), x0)
-        final = np.array(preds[-1])
-        return torch.tensor(final).clamp(0.0, 1.0).to(device)
+    predict_fn = make_ddpm_predict_fn(model, diffusion, device, args.guidance_w)
     results = evaluate_model(predict_fn, eval_loader, device,
                              model_name="DDPM", epoch=None, wandb_log=True)
     torch.save(model.state_dict(), os.path.join(args.ckpt_dir, "fire_ddpm_best.pt"))
@@ -153,9 +166,11 @@ def main(args):
         learning_rate    = 1e-4,
         weight_decay     = 0.01,
         cfg_dropout_rate = 0.2,
+        guidance_w       = args.guidance_w,
         feature_set      = args.feature_set,
         in_channels      = IN_CHANNELS,
         fold             = "fold0 (train 2018+2019, test 2021)",
+        data_range       = "[0,1] target scaled to [-1,1] for diffusion",
     )
 
     wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config=cfg)
@@ -198,7 +213,12 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir",   type=str, required=True)
     parser.add_argument("--epochs",     type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=5,
-                        help="Run full eval every N epochs. 0 = end only.")
+                        help="Run eval every N epochs. 0 = end only.")
+    parser.add_argument("--eval_samples", type=int, default=64,
+                        help="Cap periodic eval to this many test batches "
+                             "(full 1000-step sampling is slow). Final eval uses all.")
+    parser.add_argument("--guidance_w", type=float, default=2.0,
+                        help="Classifier-free guidance weight at sampling.")
     parser.add_argument("--feature_set", type=str, default="vegetation",
                         choices=["vegetation", "multi", "all"])
     main(parser.parse_args())
