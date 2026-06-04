@@ -372,8 +372,10 @@ def main(args):
         loss              = "FlowSDF: MSE on velocity field, noise->normalized SDF",
         epochs            = args.epochs,
         batch_size        = 16,
-        learning_rate     = 1e-4,
+        learning_rate     = args.lr,
         weight_decay      = 1e-4,
+        warmup_steps      = args.warmup_steps,
+        grad_clip         = args.grad_clip,
         sdf_trunc         = SDF_TRUNC,
         n_steps_inference = args.n_steps,
         feature_set       = args.feature_set,
@@ -417,7 +419,23 @@ def main(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"],
                                   weight_decay=cfg["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Per-step linear warmup -> cosine decay, keyed off the global step so that
+    # resuming picks up the schedule at the right place. This replaces the old
+    # per-epoch cosine: the previous run showed a loss explosion early in
+    # training (a high LR meeting the noise-start velocity field), and warmup is
+    # the standard remedy. total_steps must be in *steps*, not epochs.
+    total_steps  = max(1, args.epochs * len(train_loader))
+    warmup_steps = max(0, args.warmup_steps)
+
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / warmup_steps          # linear warmup from ~0
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return 0.5 * (1.0 + np.cos(np.pi * progress)) # cosine decay to 0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     global_step = 0
     start_epoch = 1
@@ -439,27 +457,51 @@ def main(args):
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
+        n_skipped  = 0
+        running    = None          # running mean of loss for spike detection
         start = time.time()
         for step, batch in enumerate(train_loader):
             x, y = batch
             x0 = x[:, 0, :, :, :].to(device)
             x1 = y.unsqueeze(1).float().to(device)
             loss = flow_matching_loss(model, x0, x1, sdf_mean, sdf_std)
+            loss_val = loss.item()
+
+            # Spike guard: skip the optimizer step on a non-finite loss or one
+            # that is wildly above the running mean (a single pathological batch
+            # corrupting the weights is exactly what derailed the prior run).
+            spike = (not np.isfinite(loss_val)) or \
+                    (running is not None and loss_val > 5.0 * running)
+            if spike:
+                optimizer.zero_grad(set_to_none=True)
+                n_skipped += 1
+                global_step += 1
+                scheduler.step()
+                wandb.log({"train/step_loss": loss_val, "train/skipped": 1,
+                           "global_step": global_step})
+                continue
+
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            epoch_loss  += loss.item()
-            global_step += 1
-            wandb.log({"train/step_loss": loss.item(), "global_step": global_step})
-            if step % 50 == 0:
-                print(f"Epoch {epoch} | Step {step} | loss={loss.item():.4f}")
+            scheduler.step()                       # per-step warmup+cosine
 
-        scheduler.step()
+            running = loss_val if running is None else 0.98 * running + 0.02 * loss_val
+            epoch_loss  += loss_val
+            global_step += 1
+            wandb.log({"train/step_loss": loss_val, "train/lr": scheduler.get_last_lr()[0],
+                       "global_step": global_step})
+            if step % 50 == 0:
+                print(f"Epoch {epoch} | Step {step} | loss={loss_val:.4f}")
+
         dur = time.time() - start
-        wandb.log({"epoch": epoch, "train/epoch_loss": epoch_loss / len(train_loader),
-                   "train/lr": scheduler.get_last_lr()[0], "train/epoch_duration_sec": dur})
-        print(f"--> Epoch {epoch} | avg loss={epoch_loss/len(train_loader):.4f} | {dur:.1f}s")
+        denom = max(1, len(train_loader) - n_skipped)
+        wandb.log({"epoch": epoch, "train/epoch_loss": epoch_loss / denom,
+                   "train/lr": scheduler.get_last_lr()[0],
+                   "train/epoch_skipped": n_skipped, "train/epoch_duration_sec": dur})
+        print(f"--> Epoch {epoch} | avg loss={epoch_loss/denom:.4f} | "
+              f"skipped={n_skipped} | {dur:.1f}s")
 
         torch.save({"epoch": epoch, "global_step": global_step,
                     "model": model.state_dict(), "optimizer": optimizer.state_dict(),
@@ -507,4 +549,10 @@ if __name__ == "__main__":
                         choices=["vegetation", "multi", "all"])
     parser.add_argument("--n_steps", type=int, default=50,
                         help="Euler integration steps at inference (noise -> SDF).")
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="Peak learning rate (lowered from 1e-4 for stability).")
+    parser.add_argument("--warmup_steps", type=int, default=500,
+                        help="Linear LR warmup steps before cosine decay.")
+    parser.add_argument("--grad_clip", type=float, default=0.5,
+                        help="Max gradient norm (tightened from 1.0).")
     main(parser.parse_args())
