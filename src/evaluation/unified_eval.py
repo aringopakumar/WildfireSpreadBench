@@ -10,15 +10,17 @@ thresholds, and identical metric implementations.
 
 Patches vs. previous version
 -----------------------------
-- The convenience wrappers (evaluate_bce_unet, evaluate_flow, evaluate_ddpm)
-  now squeeze the leading time dimension inside predict_fn. FireSpreadDataset
-  yields x of shape [B, T, C, H, W]; the models expect [B, C, H, W]. The
-  previous wrappers fed the 5-D tensor straight in, which crashed when the
-  wrappers were called directly (the in-training inline predict_fns already
-  did the squeeze, which is why periodic eval worked but standalone eval did
-  not).
-- evaluate_flow imported `flow_matching_pure` from a "model" dir that does not
-  exist; corrected to import integrate_flow from src.generative.flow_matching.
+- evaluate_model gains an optional `max_batches` cap. DDPM's 1000-step reverse
+  process makes full-test periodic eval expensive; capping the number of test
+  batches during training keeps it affordable. Final eval passes max_batches=None
+  to use the entire test set. Set-once, explicit, and logged via model_name tag.
+- evaluate_ddpm now recovers the probability map via diffusion.sample_to_prob,
+  which maps the [-1,1] sampler output to [0,1]. The previous wrapper clamped
+  the raw sampler output to [0,1], discarding half the range and miscalibrating
+  AP. (The matching [0,1]->[-1,1] scaling of the training target is in
+  diffusion.train_losses.)
+- The convenience wrappers squeeze the leading time dim (FireSpreadDataset
+  yields x of shape [B, T, C, H, W]; models expect [B, C, H, W]).
 
 predict_fn signature
 --------------------
@@ -61,13 +63,18 @@ def evaluate_model(
     threshold: float = 0.5,
     wandb_log: bool = True,
     verbose: bool = True,
+    max_batches=None,
 ) -> dict:
     """
-    Run inference over the full eval loader and compute all benchmark metrics.
+    Run inference over the eval loader and compute all benchmark metrics.
 
     eval_loader yields (x0, x1). x0 = conditioning (as stored by the dataset,
     i.e. possibly [B, T, C, H, W]); x1 = binary target. predict_fn is
     responsible for any reshaping its model needs.
+
+    max_batches: if set, evaluate only the first `max_batches` batches. Used to
+    keep DDPM periodic eval affordable; final eval should pass None.
+
     Returns dict with keys: ap, f1, precision, recall, iou (all Python floats).
     """
     tag = f"epoch_{epoch}" if epoch is not None else "final"
@@ -77,6 +84,8 @@ def evaluate_model(
 
     with torch.no_grad():
         for step, (x0, x1) in enumerate(eval_loader):
+            if max_batches is not None and step >= max_batches:
+                break
             x0 = x0.to(device)
             x1 = x1.to(device)
 
@@ -169,11 +178,14 @@ def evaluate_bce_unet(model, eval_loader, device, epoch=None, wandb_log=True):
 @torch.no_grad()
 def evaluate_flow(model, eval_loader, device, n_steps=50, epoch=None, wandb_log=True):
     """Pure Flow Matching (VectorFieldNet)."""
-    from src.generative.flow_matching import integrate_flow
+    from src.generative.flow_matching import integrate_flow, estimate_sdf_stats
     model.eval()
+    # Flow matching needs SDF normalization stats; recover from the loader's
+    # dataset so standalone eval matches training-time recovery.
+    sdf_mean, sdf_std = estimate_sdf_stats(eval_loader.dataset)
     def predict_fn(x0):
         x0 = x0[:, 0, :, :, :]          # [B, T, C, H, W] -> [B, C, H, W]
-        _, prob = integrate_flow(model, x0, n_steps=n_steps, device=device)
+        _, prob = integrate_flow(model, x0, sdf_mean, sdf_std, n_steps=n_steps, device=device)
         return prob
     return evaluate_model(
         predict_fn=predict_fn, eval_loader=eval_loader, device=device,
@@ -182,18 +194,20 @@ def evaluate_flow(model, eval_loader, device, n_steps=50, epoch=None, wandb_log=
 
 
 @torch.no_grad()
-def evaluate_ddpm(model, diffusion, eval_loader, device, epoch=None, wandb_log=True):
-    """Classifier-Free DDPM (Unet + Diffusion)."""
+def evaluate_ddpm(model, diffusion, eval_loader, device, epoch=None,
+                  wandb_log=True, guidance_w=2.0, max_batches=None):
+    """Classifier-Free DDPM (Unet + Diffusion).
+
+    Recovery via diffusion.sample_to_prob: the sampler runs in [-1,1] and this
+    maps the final state to a [0,1] probability map (single source of truth).
+    """
     model.eval()
     def predict_fn(x0):
         x0 = x0[:, 0, :, :, :]          # [B, T, C, H, W] -> [B, C, H, W]
-        preds = diffusion.p_sample_loop(model, (x0.shape[0], 1, x0.shape[2], x0.shape[3]), x0)
-        final = np.array(preds[-1])                       # [B, 1, H, W]
-        prob  = torch.tensor(final).clamp(0.0, 1.0)
-        return prob.to(device)
+        return diffusion.sample_to_prob(model, x0, w=guidance_w, progress=False).to(device)
     return evaluate_model(
         predict_fn=predict_fn, eval_loader=eval_loader, device=device,
-        model_name="DDPM", epoch=epoch, wandb_log=wandb_log,
+        model_name="DDPM", epoch=epoch, wandb_log=wandb_log, max_batches=max_batches,
     )
 
 
