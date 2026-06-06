@@ -1,35 +1,72 @@
+'''
+DDPM U-Net for WildfireSpreadBench.
+
+Conditioning: cross-attention via CrossAttentionConditioner in each ResBlock
+(see blocks.py). The Unet itself is unchanged — it still passes cond_img and
+mask through to each ResBlock, which now handles conditioning via cross-attention
+rather than additive injection.
+
+The only meaningful change vs. the previous unet.py is that ResBlock now
+accepts n_heads and head_dim kwargs for the cross-attention module. These
+are forwarded from Unet.__init__ so they can be tuned at construction time.
+'''
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from .blocks import AttentionBlock, ResBlock, TimestepSeqEmbedding, group_norm_layer
 
+
 class Unet(nn.Module):
-    # CHANGED: cond_ch is now 5 by default
-    def __init__(self, in_ch=1, cond_ch=5, model_ch=128, output_ch=1, res_block_num=2, 
-                 attn_res=(8, 16), dropout=0, 
-                 channel_mult=(1, 2, 2, 2), conv_resample=True, heads=4):
+    def __init__(
+        self,
+        in_ch=1,
+        cond_ch=7,
+        model_ch=128,
+        output_ch=1,
+        res_block_num=2,
+        attn_res=(8, 16),
+        dropout=0,
+        channel_mult=(1, 2, 2, 4),
+        conv_resample=True,
+        heads=4,
+        # Cross-attention conditioning hyperparameters
+        xattn_heads=4,
+        xattn_head_dim=32,
+    ):
         super().__init__()
-        self.in_ch = in_ch
-        self.cond_ch = cond_ch
-        self.model_ch = model_ch
-        self.output_ch = output_ch
-        self.res_block_num = res_block_num
-        self.attn_res = attn_res
-        self.dropout = dropout
+        self.in_ch        = in_ch
+        self.cond_ch      = cond_ch
+        self.model_ch     = model_ch
+        self.output_ch    = output_ch
+        self.res_block_num= res_block_num
+        self.attn_res     = attn_res
+        self.dropout      = dropout
         self.channel_mult = channel_mult
-        self.conv_resample = conv_resample
-        self.heads = heads
-        
-        # time embedding
+        self.conv_resample= conv_resample
+        self.heads        = heads
+        self.xattn_heads  = xattn_heads
+        self.xattn_head_dim = xattn_head_dim
+
+        # Time embedding
         time_emb_dim = model_ch * 4
         self.time_emb = nn.Sequential(
             nn.Linear(model_ch, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
-        
-        # down blocks
+
+        # Helper to build a ResBlock with cross-attention conditioning
+        def make_res(in_c, out_c):
+            return ResBlock(
+                in_ch=in_c, out_ch=out_c,
+                t_ch=time_emb_dim, cond_ch=cond_ch,
+                dropout=dropout,
+                n_heads=xattn_heads, head_dim=xattn_head_dim,
+            )
+
+        # ---- Down blocks ----
         self.downsample_blocks = nn.ModuleList([
             TimestepSeqEmbedding(nn.Conv2d(in_ch, model_ch, kernel_size=3, padding=1))
         ])
@@ -38,7 +75,7 @@ class Unet(nn.Module):
         ds = 1
         for step, mult in enumerate(channel_mult):
             for _ in range(res_block_num):
-                layers = [ResBlock(ch, model_ch * mult, time_emb_dim, cond_ch, dropout)]
+                layers = [make_res(ch, model_ch * mult)]
                 ch = model_ch * mult
                 if ds in attn_res:
                     layers.append(AttentionBlock(ch, heads))
@@ -48,20 +85,19 @@ class Unet(nn.Module):
                 self.downsample_blocks.append(TimestepSeqEmbedding(DownSample(ch, conv_resample)))
                 downsample_blocks_ch.append(ch)
                 ds *= 2
-        
-        # middle blocks
+
+        # ---- Middle blocks ----
         self.mid_blocks = TimestepSeqEmbedding(
-            ResBlock(ch, ch, time_emb_dim, cond_ch, dropout),
+            make_res(ch, ch),
             AttentionBlock(ch, heads),
-            ResBlock(ch, ch, time_emb_dim, cond_ch, dropout)
+            make_res(ch, ch),
         )
-        
-        # up blocks
+
+        # ---- Up blocks ----
         self.upsample_blocks = nn.ModuleList([])
         for step, mult in enumerate(channel_mult[::-1]):
             for i in range(res_block_num + 1):
-                layers = [
-                    ResBlock(ch + downsample_blocks_ch.pop(), model_ch * mult, time_emb_dim, cond_ch, dropout)]
+                layers = [make_res(ch + downsample_blocks_ch.pop(), model_ch * mult)]
                 ch = model_ch * mult
                 if ds in attn_res:
                     layers.append(AttentionBlock(ch, heads))
@@ -69,41 +105,39 @@ class Unet(nn.Module):
                     layers.append(UpSample(ch, conv_resample))
                     ds //= 2
                 self.upsample_blocks.append(TimestepSeqEmbedding(*layers))
-                
+
         self.output = nn.Sequential(
             group_norm_layer(ch),
             nn.SiLU(),
             nn.Conv2d(ch, output_ch, kernel_size=3, padding=1)
         )
-    
+
     def forward(self, x, timesteps, cond_img, mask):
         hs = []
         t_emb = self.time_emb(time_embedding(timesteps, dim=self.model_ch))
-        
+
         h = x
         for module in self.downsample_blocks:
             if cond_img.shape[2:] != h.shape[2:]:
                 cond_img = F.interpolate(cond_img, size=h.shape[2:], mode='nearest')
             h = module(h, t_emb, cond_img, mask)
             hs.append(h)
-            
+
         if cond_img.shape[2:] != h.shape[2:]:
             cond_img = F.interpolate(cond_img, size=h.shape[2:], mode='nearest')
         h = self.mid_blocks(h, t_emb, cond_img, mask)
-        
+
         for module in self.upsample_blocks:
             h_skip = hs.pop()
-            
             if h.shape[2:] != h_skip.shape[2:]:
                 h = F.interpolate(h, size=h_skip.shape[2:], mode='nearest')
-
             if cond_img.shape[2:] != h.shape[2:]:
                 cond_img = F.interpolate(cond_img, size=h.shape[2:], mode='nearest')
-
             cat_in = torch.cat([h, h_skip], dim=1)
             h = module(cat_in, t_emb, cond_img, mask)
-        
+
         return self.output(h)
+
 
 class UpSample(nn.Module):
     def __init__(self, ch, apply_conv):
@@ -111,19 +145,22 @@ class UpSample(nn.Module):
         self.apply_conv = apply_conv
         if apply_conv:
             self.conv = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
-    
+
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x) if self.apply_conv else x
 
+
 class DownSample(nn.Module):
     def __init__(self, ch, apply_conv):
         super(DownSample, self).__init__()
-        self.out = nn.Conv2d(ch, ch, kernel_size=3, padding=1, stride=2) if apply_conv else nn.AvgPool2d(kernel_size=2, stride=2)
-    
+        self.out = nn.Conv2d(ch, ch, kernel_size=3, padding=1, stride=2) \
+            if apply_conv else nn.AvgPool2d(kernel_size=2, stride=2)
+
     def forward(self, x):
         return self.out(x)
-    
+
+
 def time_embedding(timesteps, dim, max_period=1000):
     half = dim // 2
     freqs = torch.exp(
@@ -131,4 +168,5 @@ def time_embedding(timesteps, dim, max_period=1000):
     ).to(device=timesteps.device)
     args = timesteps[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    return embedding if dim % 2 == 0 else torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding if dim % 2 == 0 \
+        else torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
