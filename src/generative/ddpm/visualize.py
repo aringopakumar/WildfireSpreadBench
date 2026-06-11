@@ -1,109 +1,200 @@
-import os, sys, torch, h5py, numpy as np
+"""
+src/generative/ddpm/visualize.py
+
+Visualize SDF-DDPM next-day fire predictions vs. ground truth.
+
+Rewritten for the actual dataset format and the SDF-DDPM pipeline:
+
+- DATA: loads through FireSpreadDataset, i.e. the SAME .hdf5 files
+  (one file per fire, "data" array of shape [T, 23, H, W]) and the SAME
+  preprocessing (fixed 2018+2019 standardization, vegetation channel subset
+  [0,1,2,3,4,38,39], binary active-fire channel) that the model trains and
+  evaluates on. The previous version expected per-day .h5 files with an
+  "imagery" key and skipped all preprocessing, so it found zero files on
+  this dataset and did not represent what the model actually sees.
+- MODEL/SAMPLER: loads the training checkpoint (dict with model weights AND
+  the SDF normalization stats), rebuilds Diffusion with the stored
+  sdf_mean/sdf_std/sdf_trunc, and recovers predictions via
+  diffusion.sample_to_prob. The raw sampler output is a normalized SDF in
+  roughly [-9, +0.1], NOT a [0,1] image, so it must go through this recovery.
+- SIZE: scenes are center-cropped to 128x128 (the training crop size).
+  Full-scene sampling is intractable: 1000 reverse steps x 2 CFG forwards
+  per image, with cross-attention compute quadratic in pixel count.
+
+Output: a grid (one row per example) with columns
+  [today's fire (input) | predicted probability | predicted mask | ground truth]
+saved to <ckpt_dir>/ddpm_predictions.png.
+
+Run from the repo root:
+  PYTHONPATH=. python src/generative/ddpm/visualize.py \
+      --data_dir ~/RAM/data/hdf5_new --ckpt_dir ckpts/ddpm_vegetation
+"""
+
+import os, sys, argparse, contextlib
+import numpy as np
+import torch
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset
-from pathlib import Path
+import torchvision.transforms.functional as TF
 
+sys.path.insert(0, 'src')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from ddpm.unet import Unet
-from ddpm.diffusion_proc import Diffusion
+from ddpm.diffusion_proc import Diffusion, SDF_TRUNC
+from dataloader.FireSpreadDataset import FireSpreadDataset
 
-class FixedVisualizeDataset(Dataset):
-    def __init__(self, data_dir):
-        self.samples = []
-        test_path = Path(data_dir) / "2021"
-        for folder in [f for f in test_path.iterdir() if f.is_dir()]:
-            files = sorted(list(folder.glob("*.h5")))
-            for i in range(len(files) - 1):
-                self.samples.append((files[i], files[i+1]))
+FEATURE_SETS = {
+    "vegetation": [0, 1, 2, 3, 4, 38, 39],
+    "multi": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14,
+              16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+              27, 28, 29, 30, 31, 32, 38, 39],
+    "all": None,
+}
+CHANNELS = {"vegetation": 7, "multi": 34, "all": 40}
 
-    def __len__(self): return len(self.samples)
+TEST_YEARS  = [2021]
+STATS_YEARS = [2018, 2019]
 
-    def __getitem__(self, idx):
-        input_path, target_path = self.samples[idx]
-        with h5py.File(input_path, 'r') as f_in, h5py.File(target_path, 'r') as f_out:
-            raw_target = np.nan_to_num(f_out['imagery'][22], nan=0.0)
-            full_target = np.where(raw_target > 0, 1.0, 0.0).astype(np.float32)
-            
-            # VEGETATION ABLATION: I1, I2, M11, NDVI, EVI2 (0, 1, 2, 3, 4) and Fire (22)
-            raw_cond = f_in['imagery'][[0, 1, 2, 3, 4, 22]]
-            
-            c_I1 = np.nan_to_num(raw_cond[0], nan=0.0)
-            c_I2 = np.nan_to_num(raw_cond[1], nan=0.0)
-            c_M11 = np.nan_to_num(raw_cond[2], nan=0.0)
-            c_ndvi = np.nan_to_num(raw_cond[3], nan=0.0)
-            c_evi2 = np.nan_to_num(raw_cond[4], nan=0.0)
-            
-            raw_c_fire = np.nan_to_num(raw_cond[5], nan=0.0)
-            c_fire = np.where(raw_c_fire > 0, 1.0, 0.0)
-            
-            # Stack into exactly 6 channels
-            full_cond = np.stack([c_fire, c_I1, c_I2, c_M11, c_ndvi, c_evi2], axis=0).astype(np.float32)
-            
-            h, w = full_target.shape
-            new_h, new_w = (h // 32) * 32, (w // 32) * 32
-            top, left = (h - new_h) // 2, (w - new_w) // 2
-            
-            cond_img = full_cond[:, top:top+new_h, left:left+new_w]
-            target_img = full_target[top:top+new_h, left:left+new_w]
 
-        return torch.from_numpy(target_img[np.newaxis, ...]), torch.from_numpy(cond_img)
+def load_checkpoint(ckpt_dir, ckpt_name, device):
+    """Load model weights + SDF stats.
 
-def visualize_prediction(model, loader, diffusion, device, save_path="fire_prediction_plot.png"):
-    model.eval()
-    print("Hunting for a real fire...")
-    for target, cond in loader:
-        if cond[0, 0].sum() >= 50: 
-            break
+    fire_ddpm_last.pt is a dict holding both the weights and the SDF stats.
+    fire_ddpm_best.pt is weights-only; in that case the stats are pulled from
+    the companion fire_ddpm_last.pt (training always stores them there).
+    Returns (state_dict, sdf_mean, sdf_std, sdf_trunc).
+    """
+    path = os.path.join(ckpt_dir, ckpt_name)
+    ckpt = torch.load(path, map_location=device)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        return (ckpt["model"], float(ckpt["sdf_mean"]), float(ckpt["sdf_std"]),
+                float(ckpt.get("sdf_trunc", SDF_TRUNC)))
 
-    target, cond = target.to(device), cond.to(device)
-    print(f"Found a fire with {int(cond[0,0].sum().item())} pixels! Generating...")
-    
-    with torch.no_grad(), torch.amp.autocast('cuda'):
-        prediction = diffusion.p_sample_loop(model, target.shape, cond)
-        
-    final_pred = prediction[-1][0, 0]
-    
-    # Bulletproof check to handle both numpy arrays and PyTorch tensors
-    if torch.is_tensor(final_pred):
-        final_pred = final_pred.cpu().numpy()
-            
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].imshow(cond[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
-    axs[0].set_title("Input: Today's Fire")
-    axs[0].axis('off')
-    
-    axs[1].imshow(target[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
-    axs[1].set_title("Ground Truth: Tomorrow's Fire")
-    axs[1].axis('off')
-    
-    axs[2].imshow(final_pred, cmap='magma', vmin=0, vmax=1)
-    axs[2].set_title("Model Prediction")
-    axs[2].axis('off')
-    
+    last = os.path.join(ckpt_dir, "fire_ddpm_last.pt")
+    if not os.path.exists(last):
+        raise FileNotFoundError(
+            f"{ckpt_name} contains no SDF stats and {last} was not found. "
+            "Point --ckpt_name at fire_ddpm_last.pt instead.")
+    meta = torch.load(last, map_location="cpu")
+    return (ckpt, float(meta["sdf_mean"]), float(meta["sdf_std"]),
+            float(meta.get("sdf_trunc", SDF_TRUNC)))
+
+
+def find_examples(dataset, crop, num_examples, min_fire_pixels):
+    """Center-crop test scenes and keep crops that actually contain fire
+    (in the target, or failing that the input), so the panels are meaningful.
+    Center crops of fire-centered scenes usually qualify within a few items.
+    """
+    found = []
+    for i in range(len(dataset)):
+        x, y = dataset[i]                                  # x: [T,C,H,W], y: [H,W]
+        x = TF.center_crop(x, [crop, crop])
+        y = TF.center_crop(y.unsqueeze(0), [crop, crop]).squeeze(0)
+        target_fire = int(y.sum().item())
+        input_fire  = int(x[0, -1].sum().item())           # last channel = binary AF
+        if target_fire >= min_fire_pixels or input_fire >= min_fire_pixels:
+            found.append((x, y))
+            print(f"  example {len(found)}: dataset idx {i} "
+                  f"(input fire px={input_fire}, target fire px={target_fire})")
+            if len(found) >= num_examples:
+                break
+    return found
+
+
+@torch.no_grad()
+def visualize(model, diffusion, examples, device, guidance_w, save_path):
+    xs = torch.stack([x[0] for x, _ in examples]).to(device)    # [N, C, H, W]
+    ys = torch.stack([y for _, y in examples]).float()          # [N, H, W]
+
+    print(f"Sampling {len(examples)} predictions "
+          f"({diffusion.timesteps} reverse steps x 2 CFG forwards each)...")
+    amp = (torch.amp.autocast("cuda") if device.type == "cuda"
+           else contextlib.nullcontext())
+    with amp:
+        prob = diffusion.sample_to_prob(model, xs, w=guidance_w, progress=True)
+    prob = prob.float().cpu()                                   # [N, 1, H, W]
+    # prob = sigmoid(-sdf_pixels / 2), so prob >= 0.5 <=> sdf <= 0,
+    # i.e. exactly the SDF zero-level-set mask -- no need to resample.
+    pred_mask = (prob >= 0.5).float()
+
+    n = len(examples)
+    fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n), squeeze=False)
+    fig.suptitle(f"SDF-DDPM next-day fire predictions (guidance w={guidance_w})",
+                 fontsize=14)
+    titles = ["Today's fire (input)", "Predicted probability",
+              "Predicted mask", "Ground truth (tomorrow)"]
+    for c, t in enumerate(titles):
+        axes[0, c].set_title(t, fontsize=12)
+    for r in range(n):
+        axes[r, 0].imshow(xs[r, -1].cpu().numpy(), cmap="magma", vmin=0, vmax=1)
+        axes[r, 1].imshow(prob[r, 0].numpy(),      cmap="magma", vmin=0, vmax=1)
+        axes[r, 2].imshow(pred_mask[r, 0].numpy(), cmap="magma", vmin=0, vmax=1)
+        axes[r, 3].imshow(ys[r].numpy(),           cmap="magma", vmin=0, vmax=1)
+        for c in range(4):
+            axes[r, c].axis("off")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Success! Saved to {os.path.abspath(save_path)}")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved visualization to {os.path.abspath(save_path)}")
+
+
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    features_to_keep = FEATURE_SETS[args.feature_set]
+    in_channels      = CHANNELS[args.feature_set]
+
+    print("Loading checkpoint...")
+    state, sdf_mean, sdf_std, sdf_trunc = load_checkpoint(
+        args.ckpt_dir, args.ckpt_name, device)
+    print(f"SDF stats from checkpoint: mean={sdf_mean:.4f} std={sdf_std:.4f} "
+          f"trunc={sdf_trunc} | recovery threshold={-sdf_mean/sdf_std:.4f}")
+
+    model = Unet(in_ch=1, cond_ch=in_channels, output_ch=1,
+                 model_ch=128, channel_mult=(1, 2, 2, 4)).to(device)
+    model.load_state_dict(state)
+    model.eval()
+
+    diffusion = Diffusion(timesteps=1000, noise_schedule="sigmoid",
+                          sdf_mean=sdf_mean, sdf_std=sdf_std, sdf_trunc=sdf_trunc)
+
+    print("Loading test data (2021) through FireSpreadDataset...")
+    test_dataset = FireSpreadDataset(
+        data_dir=args.data_dir, included_fire_years=TEST_YEARS,
+        n_leading_observations=1, n_leading_observations_test_adjustment=5,
+        crop_side_length=128, load_from_hdf5=True, is_train=False,
+        remove_duplicate_features=False, features_to_keep=features_to_keep,
+        stats_years=STATS_YEARS,
+    )
+
+    print(f"Scanning for {args.num_examples} crops containing fire...")
+    examples = find_examples(test_dataset, args.crop, args.num_examples,
+                             min_fire_pixels=args.min_fire_pixels)
+    if not examples:
+        raise RuntimeError("No crops with enough fire pixels were found. "
+                           "Lower --min_fire_pixels and try again.")
+
+    save_path = os.path.join(args.ckpt_dir, "ddpm_predictions.png")
+    visualize(model, diffusion, examples, device, args.guidance_w, save_path)
+
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",  type=str, required=True,
-                        help="Root of HDF5 dataset (contains 2018/, 2019/, ...)")
+                        help="Root of the HDF5 dataset (contains 2018/ 2019/ 2021/ ...)")
     parser.add_argument("--ckpt_dir",  type=str, required=True,
                         help="Directory containing model checkpoints")
     parser.add_argument("--ckpt_name", type=str, default="fire_ddpm_last.pt",
-                        help="Checkpoint filename to load")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Updated to cond_ch=6
-    model = Unet(in_ch=1, cond_ch=6, output_ch=1, model_ch=128, channel_mult=(1, 2, 2, 4)).to(device)
-    ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-    
-    dataset = FixedVisualizeDataset(args.data_dir)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True) 
-    diffusion = Diffusion(timesteps=1000, noise_schedule='sigmoid')
-    visualize_prediction(model, loader, diffusion, device)
+                        help="Checkpoint filename (fire_ddpm_last.pt has the SDF stats)")
+    parser.add_argument("--feature_set", type=str, default="vegetation",
+                        choices=["vegetation", "multi", "all"])
+    parser.add_argument("--num_examples", type=int, default=4,
+                        help="Rows in the output figure")
+    parser.add_argument("--crop", type=int, default=128,
+                        help="Center-crop size (128 = training crop size)")
+    parser.add_argument("--guidance_w", type=float, default=2.0,
+                        help="Classifier-free guidance weight (match training/eval)")
+    parser.add_argument("--min_fire_pixels", type=int, default=20,
+                        help="Minimum fire pixels for a crop to be shown")
+    main(parser.parse_args())
