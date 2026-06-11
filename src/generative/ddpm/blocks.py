@@ -10,6 +10,14 @@ Conditioning changed from additive feature injection to cross-attention:
 This gives the model explicit spatial selectivity over the conditioning —
 it can learn to attend to the fire boundary specifically rather than
 receiving a uniform additive signal across all channels.
+
+Memory note (approved change): the attention in CrossAttentionConditioner is
+computed via F.scaled_dot_product_attention with q/k/v laid out as
+[B, heads, N, head_dim] with head_dim contiguous-last. This lets PyTorch
+dispatch to its fused flash / memory-efficient kernels, which compute the
+same softmax(q k^T * scale) v in tiles WITHOUT materializing the [N, N]
+score matrix (~64 GiB at 128x128). The math is identical to the original
+explicit einsum + softmax; only the memory behavior changes.
 '''
 
 import torch
@@ -113,33 +121,43 @@ class CrossAttentionConditioner(nn.Module):
         B, C, H, W = x.shape
         Hh = self.n_heads
         D  = self.head_dim
+        N  = H * W
 
         # Queries from hidden state
         q = self.to_q(self.norm_q(x))                    # [B, Hh*D, H, W]
-        q = q.reshape(B, Hh, D, H * W)                   # [B, Hh, D, HW]
-        q = q.permute(0, 1, 3, 2)                        # [B, Hh, HW, D]
 
         # Keys and values from conditioning image
         c  = self.cond_proj(cond_img)                    # [B, Hh*D, H, W]
         k  = self.to_k(c)                                # [B, Hh*D, H, W]
         v  = self.to_v(c)                                # [B, Hh*D, H, W]
 
-        # Apply CFG mask: zero out keys/values for unconditional samples
-        # mask shape [B] -> [B, 1, 1, 1]
-        cfg = mask.float().view(B, 1, 1, 1)
+        # Apply CFG mask: zero out keys/values for unconditional samples.
+        # Cast the mask to k's dtype (instead of .float()) so that under AMP
+        # autocast q/k/v keep one consistent dtype going into SDPA.
+        cfg = mask.to(dtype=k.dtype).view(B, 1, 1, 1)
         k   = k * cfg
         v   = v * cfg
 
-        k = k.reshape(B, Hh, D, H * W).permute(0, 1, 3, 2)   # [B, Hh, HW, D]
-        v = v.reshape(B, Hh, D, H * W).permute(0, 1, 3, 2)   # [B, Hh, HW, D]
+        # Reshape to [B, heads, N, head_dim] with head_dim as the CONTIGUOUS
+        # LAST dimension. This exact layout is what allows PyTorch to dispatch
+        # scaled_dot_product_attention to its fused flash / memory-efficient
+        # kernels. (The previous permute left the last dim with stride N,
+        # which silently forced the math backend — i.e. the full [N, N]
+        # score matrix, ~64 GiB at 128x128.)
+        q = q.reshape(B, Hh, D, N).transpose(2, 3).contiguous()   # [B, Hh, N, D]
+        k = k.reshape(B, Hh, D, N).transpose(2, 3).contiguous()   # [B, Hh, N, D]
+        v = v.reshape(B, Hh, D, N).transpose(2, 3).contiguous()   # [B, Hh, N, D]
 
-        # Scaled dot-product attention
-        attn = torch.einsum("bhid,bhjd->bhij", q, k) * self.scale   # [B, Hh, HW, HW]
-        attn = attn.softmax(dim=-1)
+        # Scaled dot-product attention — mathematically identical to
+        #   attn = softmax(q @ k^T * self.scale); out = attn @ v
+        # but computed in tiles, never materializing the [N, N] matrix.
+        # scale=self.scale (= head_dim ** -0.5) matches the original explicit
+        # scaling exactly (and is also SDPA's default for this head_dim).
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)  # [B, Hh, N, D]
 
-        out = torch.einsum("bhij,bhjd->bhid", attn, v)               # [B, Hh, HW, D]
-        out = out.permute(0, 1, 3, 2).reshape(B, Hh * D, H, W)      # [B, Hh*D, H, W]
-        out = self.to_out(out)                                         # [B, hidden_ch, H, W]
+        # Back to image layout
+        out = out.transpose(2, 3).reshape(B, Hh * D, H, W)        # [B, Hh*D, H, W]
+        out = self.to_out(out)                                    # [B, hidden_ch, H, W]
 
         return out
 
