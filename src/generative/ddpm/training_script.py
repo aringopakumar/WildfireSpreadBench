@@ -15,7 +15,20 @@ Patches vs. previous version
   passed into Diffusion, and stored in the checkpoint for exact resume/eval.
 - Sampling recovery goes through diffusion.sample_to_prob (normalized SDF ->
   pixel SDF -> [0,1] probability via flow's sdf_to_prob).
-- Periodic eval capped to --eval_samples batches; --guidance_w exposed.
+- PERIODIC MONITOR EVAL (this version): periodic eval every --eval_every epochs
+  now runs on a small monitor set of 128x128 CENTER CROPS of the test scenes
+  (MonitorCropDataset below), batched 8 at a time, and is logged to wandb as
+  "DDPM-monitor". Rationale: each evaluated image costs timesteps x 2 (CFG)
+  full forward passes, and the cross-attention conditioner's compute scales
+  with the SQUARE of the pixel count, so full-scene periodic eval is
+  intractable (hours per image). Cropping the monitor set to the training crop
+  size makes periodic eval finish in minutes while still showing whether the
+  conditioning is being learned (AP off the base-rate floor).
+  The FINAL eval is unchanged: full test set, full-size scenes, full sampler,
+  logged as "DDPM". Monitor numbers are a training signal only and are NOT
+  protocol-comparable to the final benchmark numbers.
+- batch_size pinned to 16: verified to fit a 40GB A100 with the SDPA
+  cross-attention blocks (32 OOMs).
 
 Otherwise unchanged: W&B logging, checkpoint resume, AMP, cosine LR, CFG.
 """
@@ -24,10 +37,11 @@ import os, argparse, time, torch, sys, numpy as np
 sys.path.insert(0, 'src')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import torchvision.transforms.functional as TF
 from ddpm.unet import Unet
 from ddpm.diffusion_proc import Diffusion, estimate_sdf_stats, SDF_TRUNC
 from dataloader.FireSpreadDataset import FireSpreadDataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import wandb
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -47,6 +61,32 @@ TEST_YEARS  = [2021]
 STATS_YEARS = [2018, 2019]
 
 
+class MonitorCropDataset(Dataset):
+    """Center-crops full-size test scenes to a fixed small size, for PERIODIC
+    monitoring eval only. Final eval uses the untouched full-size eval_loader.
+
+    Why this exists: periodic eval with this architecture is intractable on
+    full scenes (1000 reverse steps x 2 CFG forwards per image, with
+    cross-attention compute quadratic in pixel count). 128x128 matches the
+    training crop size, so monitor metrics track what the model is learning.
+    Crops at fixed image centers, no augmentation -> deterministic and
+    comparable across epochs. Logged as "DDPM-monitor", separate from the
+    full-protocol "DDPM" numbers.
+    """
+    def __init__(self, base_dataset, size=128):
+        self.base = base_dataset
+        self.size = size
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        x, y = self.base[idx]                            # x: [T,C,H,W], y: [H,W]
+        x = TF.center_crop(x, [self.size, self.size])
+        y = TF.center_crop(y.unsqueeze(0), [self.size, self.size]).squeeze(0)
+        return x, y
+
+
 def make_ddpm_predict_fn(model, diffusion, device, guidance_w):
     """predict_fn returning a [0,1] prob map; recovery via sample_to_prob."""
     def predict_fn(x0):
@@ -59,9 +99,9 @@ def make_ddpm_predict_fn(model, diffusion, device, guidance_w):
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-def train(model, loader, eval_loader, diffusion, device, args):
+def train(model, loader, eval_loader, monitor_loader, diffusion, device, args):
     guidance_w   = getattr(args, "guidance_w", 2.0)
-    eval_samples = getattr(args, "eval_samples", 64)
+    eval_samples = getattr(args, "eval_samples", 8)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -133,8 +173,12 @@ def train(model, loader, eval_loader, diffusion, device, args):
         if args.eval_every > 0 and epoch % args.eval_every == 0:
             model.eval()
             predict_fn = make_ddpm_predict_fn(model, diffusion, device, guidance_w)
-            evaluate_model(predict_fn, eval_loader, device,
-                           model_name="DDPM", epoch=epoch, wandb_log=True,
+            # Periodic MONITOR eval: small batches of 128x128 center crops so
+            # this finishes in minutes (full scenes are intractable here; see
+            # module docstring). Logged as DDPM-monitor to keep these training
+            # signals separate from the full-protocol final numbers (DDPM).
+            evaluate_model(predict_fn, monitor_loader, device,
+                           model_name="DDPM-monitor", epoch=epoch, wandb_log=True,
                            max_batches=eval_samples)
             model.train()
 
@@ -160,11 +204,12 @@ def main(args):
     guidance_w = getattr(args, "guidance_w", 2.0)
 
     cfg = dict(
-        architecture     = "DDPM (Unet, model_ch=128, CFG) + SDF target",
+        architecture     = "DDPM (Unet, model_ch=128, CFG, x-attn cond) + SDF target",
         noise_schedule   = "sigmoid",
         timesteps        = 1000,
         epochs           = args.epochs,
-        batch_size       = 32,
+        # 16 fits the 40GB A100 with the SDPA cross-attention blocks (32 OOMs).
+        batch_size       = 16,
         learning_rate    = 1e-4,
         weight_decay     = 0.01,
         cfg_dropout_rate = 0.2,
@@ -174,6 +219,7 @@ def main(args):
         in_channels      = IN_CHANNELS,
         fold             = "fold0 (train 2018+2019, test 2021)",
         target           = "normalized SDF (shared with flow_matching.py)",
+        monitor_eval     = "128x128 center crops, batch 8 (DDPM-monitor)",
     )
 
     wandb.init(entity="ram-algoverse", project="WildfireSpreadBench", config=cfg)
@@ -197,6 +243,11 @@ def main(args):
     )
     eval_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
+    # Small fixed-size monitor set for periodic eval (see MonitorCropDataset).
+    # Fixed 128x128 crops CAN be batched, unlike variable full-size scenes.
+    monitor_dataset = MonitorCropDataset(test_dataset, size=128)
+    monitor_loader  = DataLoader(monitor_dataset, batch_size=8, shuffle=False)
+
     # Fixed SDF normalization stats over training masks (shared recipe with flow).
     print("Estimating fixed SDF normalization stats over training masks...")
     sdf_mean, sdf_std = estimate_sdf_stats(train_dataset, trunc=SDF_TRUNC)
@@ -215,7 +266,7 @@ def main(args):
     diffusion = Diffusion(timesteps=1000, noise_schedule="sigmoid",
                           sdf_mean=sdf_mean, sdf_std=sdf_std, sdf_trunc=SDF_TRUNC)
 
-    train(model, train_loader, eval_loader, diffusion, device, args)
+    train(model, train_loader, eval_loader, monitor_loader, diffusion, device, args)
     wandb.finish()
 
 
@@ -225,9 +276,11 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir",   type=str, required=True)
     parser.add_argument("--epochs",     type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=5,
-                        help="Run eval every N epochs. 0 = end only.")
-    parser.add_argument("--eval_samples", type=int, default=64,
-                        help="Cap periodic eval to this many test batches. Final uses all.")
+                        help="Run monitor eval every N epochs. 0 = end only.")
+    parser.add_argument("--eval_samples", type=int, default=8,
+                        help="Periodic monitor eval: number of monitor batches "
+                             "(8 crops each, so default = 64 crops). "
+                             "Final eval always uses the full test set.")
     parser.add_argument("--guidance_w", type=float, default=2.0,
                         help="Classifier-free guidance weight at sampling.")
     parser.add_argument("--feature_set", type=str, default="vegetation",
