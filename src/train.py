@@ -123,7 +123,15 @@ def main():
             model_name=model_name,
             wandb_log=True,
         )
-
+        from models.visualize_predictions import run_visualization
+            run_visualization(
+                model=cli.model,
+                datamodule=cli.datamodule,
+                output_dir=cli.config.trainer.default_root_dir,
+                model_name=model_name,
+                n_samples=8,
+                wandb_log=True,
+        )
     if cli.config.do_predict:
 
         # Produce predictions, save them in a single file, including ground truth fire targets and input fire masks.
