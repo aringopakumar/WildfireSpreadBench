@@ -79,17 +79,28 @@ class FireSpreadDataModule(LightningDataModule):
                                               features_to_keep=self.features_to_keep, return_doy=self.return_doy,
                                               stats_years=train_years)
 
+    def _loader_kwargs(self):
+        # Keeping workers (and their warm on-disk cache expectations) alive across
+        # epochs avoids paying worker startup + cold-prefetch costs at the start of
+        # every train/val loop. prefetch_factor lets each worker stage batches ahead
+        # of the GPU, which hides the Google Drive -> local copy latency.
+        kwargs = dict(num_workers=self.num_workers, pin_memory=True)
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = 4
+        return kwargs
+
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, **self._loader_kwargs())
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, **self._loader_kwargs())
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=1, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.test_dataset, batch_size=1, shuffle=False, **self._loader_kwargs())
 
     def predict_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, **self._loader_kwargs())
 
     @staticmethod
     def split_fires(data_fold_id):
