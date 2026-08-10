@@ -22,9 +22,9 @@ class MyLightningCLI(LightningCLI):
         parser.link_arguments("model.class_path",
                               "trainer.logger.init_args.name")
         parser.add_argument("--do_train", type=bool,
-                            help="If True: skip training the model.")
+                            help="If True: train the model.")
         parser.add_argument("--do_predict", type=bool,
-                            help="If True: compute predictions.")
+                            help="If True: compute and save predictions.")
         parser.add_argument("--do_test", type=bool,
                             help="If True: compute test metrics.")
         parser.add_argument("--do_validate", type=bool,

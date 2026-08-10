@@ -1,11 +1,14 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.dirname(__file__).split("/src")[-2]))
+from pathlib import Path
+
+# Repo root is three levels up (src/preprocess/<this file>), resolved without
+# string-splitting on "/src" so the script also works on Windows paths.
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.dataloader.FireSpreadDataset import FireSpreadDataset
 import argparse
 import h5py
-from pathlib import Path
 from tqdm import tqdm
 
 # Need to prevent an error with HDF5 files being locked and thereby inaccessible

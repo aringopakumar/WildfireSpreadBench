@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training outputs
+lightning_logs/
+wandb/
+checkpoints*/
+*.ckpt
+predictions_*.pt
+
+# Dataset caches
+.hdf5_cache/
+*.hdf5
+dataset_index.json
+
+# Figures produced by scripts/visualize_predictions.py
+viz_preview/
+
+# Machine-specific trainer configs (see cfgs/trainer_local.example.yaml)
+cfgs/trainer_local*.yaml
+!cfgs/trainer_local.example.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

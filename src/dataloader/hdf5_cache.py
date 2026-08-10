@@ -5,7 +5,7 @@ Google Drive FUSE cannot reliably serve HDF5 random reads. When the data_dir
 points at a cloud mount, copy each fire file to local disk on first use and
 reuse it for the rest of the Colab session.
 
-Set HDF5_CACHE_DIR to override the cache location (default: /content/.hdf5_cache).
+Set HDF5_CACHE_DIR to override the cache location.
 Set HDF5_CACHE_DISABLE=1 to turn caching off.
 Set HDF5_CACHE_FORCE=1 to always cache, even for local paths.
 """
@@ -13,13 +13,20 @@ Set HDF5_CACHE_FORCE=1 to always cache, even for local paths.
 import json
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 
 import h5py
 
-DEFAULT_CACHE_DIR = "/content/.hdf5_cache"
+# Colab's /content is local SSD and is the fast path there; elsewhere fall back
+# to the platform temp dir so this module has no Linux-only assumptions.
+DEFAULT_CACHE_DIR = (
+    "/content/.hdf5_cache"
+    if os.path.isdir("/content")
+    else os.path.join(tempfile.gettempdir(), "hdf5_cache")
+)
 INDEX_FILENAME = "dataset_index.json"
 
 

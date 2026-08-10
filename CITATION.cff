@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+title: "WildfireBenchBaselines: baselines for the WildfireSpreadBench benchmark"
+message: "If you use this software, please cite both the paper below and the WildfireSpreadTS dataset it builds on."
+type: software
+license: MIT
+repository-code: "https://github.com/mpannozzo/WildfireBenchBaselines"
+authors:
+  - family-names: Pannozzo
+    given-names: Marco
+    # TODO: add affiliation, email, and ORCID
+  # TODO: add remaining authors
+
+# TODO: fill in once the paper has a title, venue, and DOI/preprint URL.
+preferred-citation:
+  type: article
+  title: "TODO: paper title"
+  authors:
+    - family-names: Pannozzo
+      given-names: Marco
+  year: 2026
+  # journal / conference:
+  # url:
+  # doi:
+
+references:
+  - type: conference-paper
+    title: "WildfireSpreadTS: A dataset of multi-modal time series for wildfire spread prediction"
+    authors:
+      - family-names: Gerard
+        given-names: Sebastian
+      - family-names: Zhao
+        given-names: Yu
+      - family-names: Sullivan
+        given-names: Josephine
+    collection-title: "Advances in Neural Information Processing Systems 36, Datasets and Benchmarks Track"
+    year: 2023
+    url: "https://openreview.net/forum?id=RgdGkPRQ03"
+  - type: software
+    title: "utae-paps"
+    authors:
+      - family-names: Sainte Fare Garnot
+        given-names: Vivien
+    license: MIT
+    repository-code: "https://github.com/VSainteuf/utae-paps"

@@ -8,7 +8,7 @@ logger:
   init_args:
     # Determined via argument linking in train.py
     # save_dir: ${fit.trainer.default_root_dir}
-    project: wildfire_progression
+    project: wildfire-spread-bench
     log_model: true
 callbacks: 
   - class_path: pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint
