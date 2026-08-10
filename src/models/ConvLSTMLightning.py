@@ -56,6 +56,11 @@ class ConvLSTMLightning(BaseModel):
         img_height_width = tuple(img_height_width)
         kernel_size = tuple(kernel_size)
 
+        # Pop so load_from_checkpoint (which replays saved hparams via **kwargs)
+        # does not collide with required_img_size, which we set explicitly below
+        # from img_height_width.
+        kwargs.pop("required_img_size", None)
+
         super().__init__(
             n_channels=n_channels,
             flatten_temporal_dimension=flatten_temporal_dimension,

@@ -17,11 +17,14 @@ class UTAELightning(BaseModel):
         *args: Any,
         **kwargs: Any
     ):
+        # Pop so load_from_checkpoint (which passes saved hparams via **kwargs)
+        # does not collide with the hardcoded use_doy=True below.
+        kwargs.pop("use_doy", None)
         super().__init__(
             n_channels=n_channels,
             flatten_temporal_dimension=flatten_temporal_dimension,
             pos_class_weight=pos_class_weight,
-            use_doy=True, # UTAE uses the day of the year as an input feature
+            use_doy=True,  # UTAE uses the day of the year as an input feature
             *args,
             **kwargs
         )
