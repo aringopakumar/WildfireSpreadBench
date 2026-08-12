@@ -4,42 +4,8 @@ Code and configurations for a unified benchmark of six architectures on
 next-day wildfire spread prediction, all scored through a single shared
 evaluation pipeline.
 
-Most work in this area is ranked by Average Precision, which summarizes
-performance across every decision threshold. But a fire manager drawing an
-evacuation boundary has to pick one threshold. This benchmark measures what
-happens when you do: **AP and threshold-dependent metrics disagree about which
-model is best.** The highest-AP model predicts 4–5× more area than actually
-burned and places fifth of six on F1 and IoU.
+For results, analysis, and notes: *link to full paper*
 
-## Results
-
-Test set is the held-out 2021 season; threshold metrics computed at 0.5.
-Rows are grouped by operating-point profile.
-
-| Model | AP (Veg) | AP (All) | F1 (Veg) | F1 (All) | IoU (Veg) | IoU (All) | P (Veg) | P (All) | R (Veg) | R (All) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| BCE U-Net | **0.562** | **0.529** | 0.308 | 0.329 | 0.182 | 0.197 | 0.186 | 0.203 | 0.896 | 0.861 |
-| UTAE | 0.383 | 0.322 | 0.115 | 0.080 | 0.061 | 0.042 | 0.061 | 0.042 | **0.969** | **0.964** |
-| ResNet18 U-Net | 0.375 | 0.401 | 0.568 | **0.585** | 0.396 | **0.413** | 0.558 | **0.599** | 0.578 | 0.572 |
-| ConvLSTM | 0.403 | 0.390 | **0.583** | 0.570 | **0.411** | 0.398 | **0.565** | 0.543 | 0.602 | 0.599 |
-| Logistic Regression | 0.352 | 0.371 | 0.548 | 0.566 | 0.378 | 0.394 | 0.501 | 0.551 | 0.606 | 0.581 |
-| Flow Matching | 0.322 | 0.350 | 0.402 | 0.425 | 0.252 | 0.270 | 0.448 | 0.465 | 0.365 | 0.392 |
-
-Three findings shape how this repository is organized:
-
-**The metric outranks the architecture.** BCE U-Net wins on AP in both feature
-configurations and loses badly on F1 and IoU. ConvLSTM and ResNet18 U-Net take
-F1, IoU, and precision. Reporting AP alone would pick a different winner than
-reporting F1 alone.
-
-**Architectures fall into three operating-point profiles** that AP cannot
-distinguish: recall-maximizing (BCE U-Net, UTAE), balanced (ConvLSTM, ResNet18
-U-Net, Logistic Regression), and precision-leaning / under-predicting (Flow
-Matching). At threshold 0.5, ConvLSTM's precision is roughly nine times UTAE's.
-
-**More input channels barely matter.** Going from 7 channels to 23 moves AP by
-0.03 on average, against a 0.21–0.24 spread across architectures. The
-seven-channel Vegetation configuration is far cheaper and performs comparably.
 
 ## Models
 
@@ -233,15 +199,6 @@ Added for this work:
   caching and indexing so training works from cloud-mounted datasets.
 - Checkpoint-resume fixes in `ConvLSTMLightning` and `UTAELightning`, and
   hyperparameter capture fixes in `BaseModel`, for current PyTorch Lightning.
-
-Two upstream caveats carry over and matter when comparing against published
-WildfireSpreadTS numbers:
-
-- A dataset-class bug was fixed upstream in commit `ab3c8f35`. Corrected numbers
-  run slightly higher than the 2023 paper's; the trends are unchanged.
-- Angle features are transformed with `sin` only, losing information a
-  `sin`/`cos` pair would preserve
-  ([upstream note](https://github.com/SebastianGer/WildfireSpreadTS/blob/main/src/dataloader/FireSpreadDataset.py#L339)).
 
 ## Citation
 
