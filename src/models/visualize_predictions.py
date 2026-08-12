@@ -195,7 +195,7 @@ def _plot_sample_grid(
 
 def _plot_pr_curve(all_targets, all_scores, model_name: str, output_dir: Path) -> Path:
     """
-    Precision-Recall curve with AP annotation and persistence baseline.
+    Precision-Recall curve with AP annotation and no-skill baseline.
     """
     precision, recall, _ = precision_recall_curve(all_targets, all_scores)
     ap = average_precision_score(all_targets, all_scores)
@@ -321,7 +321,7 @@ def run_visualization(
 
     print(f"[visualize] Collected {n_collected} samples for visualization.")
     ap = average_precision_score(all_targets, all_scores)
-    print(f"[visualize] AP over full test set: {ap:.4f}  (persistence baseline ≈ 0.193)")
+    print(f"[visualize] AP over full test set: {ap:.4f}")
 
     # ── 2. Build figures ──────────────────────────────────────────────────────
     grid_path  = _plot_sample_grid(fire_inputs, prob_maps, pred_masks, gt_masks,

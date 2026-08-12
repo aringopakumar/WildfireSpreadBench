@@ -7,16 +7,15 @@ Every model in the benchmark funnels through the same metric code, so all
 numbers in the results tables come from identical data, thresholds, and metric
 implementations.
 
-The discriminative Lightning baselines (ResNet U-Net, ConvLSTM, UTAE,
-Logistic Regression, Persistence) are evaluated through
-evaluate_lightning_module(), which reuses each model's own get_pred_and_gt
-path so temporal flattening, doy features, and tiled inference all match the
-training-time code.
+The Lightning baselines (ResNet18 U-Net, ConvLSTM, UTAE, Logistic Regression)
+are evaluated through evaluate_lightning_module(), which reuses each model's
+own get_pred_and_gt path so temporal flattening, doy features, and tiled
+inference all match the training-time code.
 
-The generative models (BCE U-Net, Flow Matching, DDPM) are evaluated through
-evaluate_model(), a model-agnostic harness: pass any predict_fn(x0) ->
-probability map. evaluate_bce_unet / evaluate_flow / evaluate_ddpm are thin
-wrappers that build the appropriate predict_fn.
+BCE U-Net and Flow Matching are evaluated through evaluate_model(), a
+model-agnostic harness: pass any predict_fn(x0) -> probability map.
+evaluate_bce_unet / evaluate_flow are thin wrappers that build the
+appropriate predict_fn.
 
 predict_fn signature
 --------------------
@@ -32,17 +31,24 @@ entire test set.
 
 Metrics
 -------
-    AP, F1, Precision, Recall, IoU. AP is the primary, threshold-free metric.
+    AP, F1, Precision, Recall, IoU. AP is threshold-free; the rest are computed
+    at a single unified threshold (0.5 by default).
 
-Baselines (WildfireSpreadTS, 12-fold mean, "All" feature set)
--------------------------------------------------------------
-    Persistence:         AP ~ 0.193
-    Logistic Regression: AP ~ 0.279
-    ResNet18 U-Net:      AP ~ 0.328
-    ConvLSTM:            AP ~ 0.306
-    UTAE (vegetation):   AP ~ 0.372
-  NOTE: these are 12-fold means. Single-fold (fold 0, test=2021) numbers
-  run noticeably higher because 2021 is an easy test year (see suppl. Fig 2).
+    All five are reported together on purpose. The central finding of the paper
+    is that AP and the threshold metrics disagree about which model is best, so
+    AP alone is not a sufficient summary: the highest-AP model here (BCE U-Net)
+    ranks fifth of six on F1 and IoU and over-predicts burned area several-fold.
+
+Published results (test year 2021, threshold 0.5, Table 1)
+----------------------------------------------------------
+                            AP              F1
+    Model                Veg    All     Veg    All
+    BCE U-Net           0.562  0.529   0.308  0.329
+    ConvLSTM            0.403  0.390   0.583  0.570
+    UTAE                0.383  0.322   0.115  0.080
+    ResNet18 U-Net      0.375  0.401   0.568  0.585
+    Logistic Regression 0.352  0.371   0.548  0.566
+    Flow Matching       0.322  0.350   0.402  0.425
 """
 
 import torch
@@ -141,9 +147,10 @@ def _print_results(model_name: str, tag: str, results: dict, threshold: float):
     print(f"  Recall    (thr={threshold}):       {results['recall']:.4f}")
     print(f"  IoU       (thr={threshold}):       {results['iou']:.4f}")
     print(f"  ---")
-    print(f"  Persistence baseline AP (12-fold mean): 0.193")
-    print(f"  ResNet18 U-Net AP (12-fold mean):       ~0.328")
-    print(f"  (Single-fold test=2021 runs higher; see suppl. Fig 2.)")
+    print(f"  Reference (2021 test, Vegetation, thr=0.5):")
+    print(f"    BCE U-Net  AP 0.562 / F1 0.308   (highest AP, over-predicts)")
+    print(f"    ConvLSTM   AP 0.403 / F1 0.583   (highest F1)")
+    print(f"  Read AP and F1 together; they rank models differently.")
     print(f"{sep}\n")
 
 
@@ -197,26 +204,6 @@ def evaluate_flow(model, eval_loader, device, n_steps=50, epoch=None, wandb_log=
     return evaluate_model(
         predict_fn=predict_fn, eval_loader=eval_loader, device=device,
         model_name="FlowMatching", epoch=epoch, wandb_log=wandb_log,
-    )
-
-
-@torch.no_grad()
-def evaluate_ddpm(model, diffusion, eval_loader, device, epoch=None,
-                  wandb_log=True, guidance_w=2.0, max_batches=None):
-    """Classifier-Free DDPM (Unet + Diffusion).
-
-    Recovery via diffusion.sample_to_prob: the sampler runs in [-1,1] and this
-    maps the final state to a [0,1] probability map (single source of truth).
-    """
-    model.eval()
-
-    def predict_fn(x0):
-        x0 = x0[:, 0, :, :, :]          # [B, T, C, H, W] -> [B, C, H, W]
-        return diffusion.sample_to_prob(model, x0, w=guidance_w, progress=False).to(device)
-
-    return evaluate_model(
-        predict_fn=predict_fn, eval_loader=eval_loader, device=device,
-        model_name="DDPM", epoch=epoch, wandb_log=wandb_log, max_batches=max_batches,
     )
 
 
