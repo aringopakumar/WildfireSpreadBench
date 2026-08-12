@@ -87,6 +87,10 @@ class MyLightningCLI(LightningCLI):
 
 
 def main():
+    # setdefault so a caller can point runs at their own project/entity without
+    # editing this file.
+    os.environ.setdefault("WANDB_PROJECT", "WildfireSpreadBench")
+    os.environ.setdefault("WANDB_ENTITY", "ram-algoverse")
 
     # LightningCLI automatically creates an argparse parser with required arguments and types,
     # and instantiates the model and datamodule. For this, it's important to import the model and datamodule classes above.
@@ -108,6 +112,29 @@ def main():
 
     if cli.config.do_test:
         cli.trainer.test(cli.model, cli.datamodule, ckpt_path=ckpt)
+
+        # Unified eval pass — identical metric computation to generative models
+        from evaluation.unified_eval import evaluate_lightning_model
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_name = cli.config.model.class_path.split(".")[-1]
+
+        evaluate_lightning_model(
+            model=cli.model.to(device),
+            datamodule=cli.datamodule,
+            device=device,
+            model_name=model_name,
+            wandb_log=True,
+        )
+        from models.visualize_predictions import run_visualization
+        run_visualization(
+            model=cli.model,
+            datamodule=cli.datamodule,
+            output_dir=cli.config.trainer.default_root_dir,
+            model_name=model_name,
+            n_samples=8,
+            wandb_log=True,
+        )
 
     if cli.config.do_predict:
 
