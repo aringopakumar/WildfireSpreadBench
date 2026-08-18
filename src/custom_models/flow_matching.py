@@ -1,5 +1,5 @@
 """
-src/generative/flow_matching.py
+src/custom_models/flow_matching.py
 
 Conditional Flow Matching for next-day wildfire spread prediction,
 reformulated in the FlowSDF style (Bogensperger et al., IJCV 2025) and adapted

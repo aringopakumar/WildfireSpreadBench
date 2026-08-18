@@ -9,22 +9,22 @@ For results, analysis, and notes: *link to full paper*
 
 ## Models
 
-Five discriminative and one generative, all trained on the same data splits.
+Four baselines and two custom models, all trained on the same data splits.
 
 | Model | Kind | Implementation | How to run |
 | --- | --- | --- | --- |
-| Logistic Regression | discriminative | `models/LogisticRegression.py` | `cfgs/LogisticRegression/full_run.yaml` |
-| ResNet18 U-Net | discriminative | `models/SMPModel.py` | `cfgs/unet/res18_monotemporal.yaml` |
-| ConvLSTM | discriminative | `models/ConvLSTMLightning.py` | `cfgs/convlstm/full_run.yaml` |
-| UTAE | discriminative | `models/UTAELightning.py` | `cfgs/UTAE/all_features.yaml` |
-| BCE U-Net | discriminative | `generative/unet_bce.py` | `--model unet_bce` |
-| Flow Matching | generative | `generative/flow_matching.py` | `--model flow` |
+| Logistic Regression | baseline | `src/baselines/LogisticRegression.py` | `cfgs/LogisticRegression/full_run.yaml` |
+| ResNet18 U-Net | baseline | `src/baselines/SMPModel.py` | `cfgs/unet/res18_monotemporal.yaml` |
+| ConvLSTM | baseline | `src/baselines/ConvLSTMLightning.py` | `cfgs/convlstm/full_run.yaml` |
+| UTAE | baseline | `src/baselines/UTAELightning.py` | `cfgs/UTAE/all_features.yaml` |
+| BCE U-Net | custom | `src/custom_models/unet_bce.py` | `--model unet_bce` |
+| Flow Matching | custom | `src/custom_models/flow_matching.py` | `--model flow` |
 
-The first four are PyTorch Lightning modules driven by YAML configs through
-`src/train.py`. BCE U-Net and Flow Matching are standalone and run through
-`src/train_generative.py`. BCE U-Net lives under `src/generative/` for
-historical reasons — it is a discriminative segmentation model trained with a
-positive-weighted binary cross-entropy objective, not a generative one.
+The four baselines are PyTorch Lightning modules driven by YAML configs through
+`src/train.py`. BCE U-Net and Flow Matching live under `src/custom_models/` and
+run through `src/train_custom.py`. BCE U-Net is a discriminative segmentation
+model trained with a positive-weighted binary cross-entropy objective; Flow
+Matching is the one generative architecture in the set.
 
 ## Data
 
@@ -79,7 +79,7 @@ Colab runtime is missing, and see `colab_train.ipynb`.
 Run everything from the repository root; both entry points import relative to
 `src/`.
 
-### Lightning models
+### Baseline models
 
 Runs are assembled from three configs — model, trainer, and data. Command-line
 arguments override config files, and later arguments override earlier ones.
@@ -112,10 +112,10 @@ With `--do_test=True`, testing is followed automatically by a unified-eval pass
 and a prediction visualization, so these results land in the same metric tables
 and W&B panels as BCE U-Net and Flow Matching.
 
-### BCE U-Net and Flow Matching
+### Custom models
 
 ```bash
-python src/train_generative.py \
+python src/train_custom.py \
   --model [unet_bce|flow] \
   --data_dir YOUR_HDF5_DIR \
   --ckpt_dir YOUR_CKPT_DIR \
@@ -142,26 +142,30 @@ the full 2021 season.
 
 Two entry points:
 
-- `evaluate_lightning_module()` for Lightning models. It calls each model's own
+- `evaluate_lightning_module()` for baseline models. It calls each model's own
   `get_pred_and_gt`, so temporal flattening, day-of-year features, and tiled
   inference match the training-time path exactly.
 - `evaluate_model()` for anything else. Pass a `predict_fn(x0) -> probability
   map` callable and it computes the identical metrics.
   `evaluate_bce_unet()` and `evaluate_flow()` are thin wrappers around it.
 
+Standalone prediction maps (UTAE and ConvLSTM checkpoints) are produced with
+`src/evaluation/visualize_predictions.py`. Baseline training also writes a
+prediction grid at the end of `--do_test=True` via
+`src/baselines/visualize_predictions.py`.
+
 ## Repository layout
 
 ```
 cfgs/                       Model, trainer, data, and sweep configs
-src/train.py                LightningCLI entry point
-src/train_generative.py     Entry point for BCE U-Net and Flow Matching
+src/train.py                LightningCLI entry point for baseline models
+src/train_custom.py         Entry point for BCE U-Net and Flow Matching
 src/dataloader/             FireSpreadDataset, datamodule, HDF5 caching/indexing
-src/models/                 Lightning models + prediction visualization
-src/generative/             BCE U-Net and Flow Matching
-src/evaluation/             Unified metric harness and in-training eval callback
+src/baselines/              Logistic Regression, ResNet18 U-Net, ConvLSTM, UTAE
+src/custom_models/          BCE U-Net and Flow Matching
+src/evaluation/             Unified metric harness, eval callback, standalone visualization
 src/preprocess/             GeoTIFF -> HDF5 conversion and indexing
-scripts/                    Checkpoint inspection, standalone visualization
-colab_train.ipynb           End-to-end Colab workflow
+
 ```
 
 ## Logging
@@ -187,14 +191,15 @@ This repository is a derivative of
 [SebastianGer/WildfireSpreadTS](https://github.com/SebastianGer/WildfireSpreadTS)
 (MIT), the code released with the WildfireSpreadTS dataset. The dataset classes,
 the datamodule, and the Logistic Regression, ResNet18 U-Net, ConvLSTM, and UTAE
-baselines originate there. `src/models/utae_paps_models/` is in turn an
+baselines originate there. `src/baselines/utae_paps_models/` is in turn an
 attributed copy from [utae-paps](https://github.com/VSainteuf/utae-paps) (MIT).
 
 Added for this work:
 
-- `src/generative/` and `src/train_generative.py` — BCE U-Net and Flow Matching.
+- `src/custom_models/` and `src/train_custom.py` — BCE U-Net and Flow Matching.
 - `src/evaluation/` — the unified metric harness that makes all six models
-  comparable, plus a callback that runs it periodically during training.
+  comparable, an in-training eval callback, and standalone prediction
+  visualization.
 - `src/dataloader/hdf5_cache.py` and `src/preprocess/BuildHDF5Index.py` — local
   caching and indexing so training works from cloud-mounted datasets.
 - Checkpoint-resume fixes in `ConvLSTMLightning` and `UTAELightning`, and

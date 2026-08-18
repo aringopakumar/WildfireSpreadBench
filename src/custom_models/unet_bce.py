@@ -3,7 +3,7 @@ Wildfire next-day spread prediction as pure conditional binary segmentation.
 
 Patches vs. previous version
 ----------------------------
-- Training body wrapped in `def main(args)` so src/train_generative.py can
+- Training body wrapped in `def main(args)` so src/train_custom.py can
   call it. A standalone `__main__` block is retained for direct runs.
 - Dataset year tuples corrected to WildfireSpreadTS fold 0:
   train = [2018, 2019], test = [2021], stats_years = [2018, 2019].

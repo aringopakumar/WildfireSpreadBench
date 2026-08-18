@@ -186,9 +186,9 @@ def evaluate_bce_unet(model, eval_loader, device, epoch=None, wandb_log=True):
 @torch.no_grad()
 def evaluate_flow(model, eval_loader, device, n_steps=50, epoch=None, wandb_log=True):
     """Pure Flow Matching (VectorFieldNet)."""
-    # Imported lazily: generative.flow_matching imports evaluate_model from this
+    # Imported lazily: custom_models.flow_matching imports evaluate_model from this
     # module, so a top-level import here would be circular.
-    from generative.flow_matching import integrate_flow, estimate_sdf_stats
+    from custom_models.flow_matching import integrate_flow, estimate_sdf_stats
 
     model.eval()
     # Flow matching needs SDF normalization stats; recover from the loader's

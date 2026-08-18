@@ -17,7 +17,7 @@ predictions_*.pt
 *.hdf5
 dataset_index.json
 
-# Figures produced by scripts/visualize_predictions.py
+# Figures produced by src/evaluation/visualize_predictions.py
 viz_preview/
 
 # Machine-specific trainer configs (see cfgs/trainer_local.example.yaml)

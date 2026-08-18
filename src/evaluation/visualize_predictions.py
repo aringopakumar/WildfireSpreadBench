@@ -5,8 +5,7 @@ Supports UTAE and ConvLSTM checkpoints via --model.
 
 Example (UTAE vegetation-only checkpoint):
 
-  cd src
-  python ../scripts/visualize_predictions.py ^
+  python src/evaluation/visualize_predictions.py ^
     --model utae ^
     --ckpt C:/data/wildfire_runs/checkpoints_utae_vegetation/epoch=46-val_loss=1.7412.ckpt ^
     --data_dir C:/data/newHDF5Data ^
@@ -16,8 +15,7 @@ Example (UTAE vegetation-only checkpoint):
 
 Example (ConvLSTM full-features checkpoint):
 
-  cd src
-  python ../scripts/visualize_predictions.py ^
+  python src/evaluation/visualize_predictions.py ^
     --model convlstm ^
     --ckpt C:/data/wildfire_runs/checkpoints_convlstm/last.ckpt ^
     --data_dir C:/data/newHDF5Data ^
@@ -38,16 +36,14 @@ import numpy as np
 import torch
 from matplotlib.colors import ListedColormap
 
-# Allow running as `python scripts/visualize_predictions.py` from repo root
-# or `python ../scripts/visualize_predictions.py` from src/.
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = REPO_ROOT / "src"
+# Allow running as `python src/evaluation/visualize_predictions.py` from repo root.
+SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from dataloader.FireSpreadDataModule import FireSpreadDataModule  # noqa: E402
-from models.UTAELightning import UTAELightning  # noqa: E402
-from models.ConvLSTMLightning import ConvLSTMLightning  # noqa: E402
+from baselines.UTAELightning import UTAELightning  # noqa: E402
+from baselines.ConvLSTMLightning import ConvLSTMLightning  # noqa: E402
 
 # Registry of supported model architectures. Maps the --model choice to its
 # Lightning class. get_pred_and_gt handles doy/cropping internally based on the

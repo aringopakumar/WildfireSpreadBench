@@ -6,7 +6,7 @@ optimizer:
   init_args:
     lr: 0.001
 model:
-  class_path: models.SMPModel
+  class_path: baselines.SMPModel
   init_args:
     encoder_name: resnet18
     n_channels: 40

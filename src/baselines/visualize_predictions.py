@@ -1,5 +1,5 @@
 """
-src/models/visualize_predictions.py
+src/baselines/visualize_predictions.py
 
 Post-training visualization for discriminative models
 (SMPModel, ConvLSTMLightning, LogisticRegression, UTAELightning, etc.).
@@ -16,7 +16,7 @@ Designed to be called at the end of train.py, after evaluate_lightning_model().
 
 Usage (standalone):
 -------------------
-python src/models/visualize_predictions.py \\
+python src/baselines/visualize_predictions.py \\
     --config cfgs/unet/res18_monotemporal.yaml \\
     --data_config cfgs/data_monotemporal_full_features.yaml \\
     --ckpt_path /path/to/best.ckpt \\
@@ -25,7 +25,7 @@ python src/models/visualize_predictions.py \\
 
 Usage (from train.py after do_test):
 --------------------------------------
-    from models.visualize_predictions import run_visualization
+    from baselines.visualize_predictions import run_visualization
     run_visualization(
         model=cli.model,
         datamodule=cli.datamodule,
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     from dataloader.FireSpreadDataModule import FireSpreadDataModule
     from dataloader.FireSpreadDataset import FireSpreadDataset
     from dataloader.utils import get_means_stds_missing_values
-    from models import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
+    from baselines import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
 
     # ── Parse configs ─────────────────────────────────────────────────────────
     with open(args.config) as f:
@@ -401,7 +401,7 @@ if __name__ == "__main__":
 
     # ── Instantiate model from config ─────────────────────────────────────────
     import importlib
-    class_path = model_cfg["model"]["class_path"]           # e.g. "models.SMPModel"
+    class_path = model_cfg["model"]["class_path"]           # e.g. "baselines.SMPModel"
     module_name, class_name = class_path.rsplit(".", 1)
     ModelClass = getattr(importlib.import_module(module_name), class_name)
     model = ModelClass.load_from_checkpoint(

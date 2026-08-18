@@ -1,11 +1,11 @@
 """
-src/train_generative.py
+src/train_custom.py
 
-Single entry point for training all generative models.
+Single entry point for training all custom models.
 
 Usage:
-  python src/train_generative.py --model unet_bce --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
-  python src/train_generative.py --model flow    --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
+  python src/train_custom.py --model unet_bce --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
+  python src/train_custom.py --model flow    --data_dir /path/to/hdf5 --ckpt_dir /path/to/ckpts --feature_set vegetation --epochs 200 --eval_every 10
 
 Note: each child module exposes a `main(args)` function. This dispatcher parses
 the shared CLI and calls it directly, rather than relying on the child's
@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 
-# The generative modules import each other relative to src/ (e.g.
+# The custom model modules import each other relative to src/ (e.g.
 # "from dataloader...", "from evaluation..."), so put src/ on the path
 # regardless of the working directory this script is launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,9 +35,9 @@ def main():
     args = parser.parse_args()
 
     if args.model == "unet_bce":
-        from generative.unet_bce import main as run
+        from custom_models.unet_bce import main as run
     elif args.model == "flow":
-        from generative.flow_matching import main as run
+        from custom_models.flow_matching import main as run
 
     run(args)
 

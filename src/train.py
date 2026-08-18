@@ -2,8 +2,8 @@ from pytorch_lightning.utilities import rank_zero_only
 import torch
 from dataloader.FireSpreadDataModule import FireSpreadDataModule
 from pytorch_lightning.cli import LightningCLI
-from models import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
-from models import BaseModel
+from baselines import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
+from baselines import BaseModel
 from evaluation.unified_eval_callback import UnifiedEvalCallback  # noqa
 import wandb
 import os
@@ -126,7 +126,7 @@ def main():
             model_name=model_name,
             wandb_log=True,
         )
-        from models.visualize_predictions import run_visualization
+        from baselines.visualize_predictions import run_visualization
         run_visualization(
             model=cli.model,
             datamodule=cli.datamodule,
