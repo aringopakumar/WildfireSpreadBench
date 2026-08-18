@@ -120,7 +120,7 @@ python src/train_custom.py \
   --data_dir YOUR_HDF5_DIR \
   --ckpt_dir YOUR_CKPT_DIR \
   --feature_set [vegetation|all] \
-  --epochs 200 \
+  --epochs 100 \
   --eval_every 10
 ```
 
