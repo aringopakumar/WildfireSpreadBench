@@ -24,7 +24,6 @@ class SMPModel(BaseModel):
             *args,
             **kwargs
         )
-        self.save_hyperparameters()
 
         self.model = smp.Unet(
             encoder_name=encoder_name,  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7

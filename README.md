@@ -1,98 +1,215 @@
-# WildfireSpreadBench
+# WildfireSpreadBench: The Metric Decides the Model in Wildfire Spread Prediction
 
-Benchmark comparing generative and discriminative models for
-wildfire spread prediction, built on WildfireSpreadTS.
+Code and configurations for a unified benchmark of six architectures on
+next-day wildfire spread prediction, all scored through a single shared
+evaluation pipeline.
 
-**Models:**
-- Discriminative: ResNet18 U-Net (SMP), ConvLSTM, UTAE, Logistic Regression, Persistence
-- Generative: DDPM, Flow Matching, BCE U-Net
-
-**Feature sets:** Vegetation | Multi | All (matching WildfireSpreadTS Table 5)
-
-## Running discriminative baselines
-These run exactly as in the original WildfireSpreadTS paper:
-
-    python src/train.py \
-      --config cfgs/unet/res18_monotemporal.yaml \
-      --trainer cfgs/trainer_single_gpu.yaml \
-      --data cfgs/data_monotemporal_full_features.yaml \
-      --trainer.max_epochs=200 \
-      --do_test=True \
-      --data.data_dir YOUR_DATA_DIR
-
-## Running generative models
-
-    python src/train_generative.py \
-      --model [unet_bce|flow|ddpm] \
-      --data_dir YOUR_DATA_DIR \
-      --ckpt_dir YOUR_CKPT_DIR \
-      --feature_set [vegetation|multi|all] \
-      --epochs 200 \
-      --eval_every 10
-
-## Data preparation
-Convert raw .tif files to HDF5 format first:
-
-    python src/preprocess/CreateHDF5Dataset.py \
-      --data_dir /path/to/raw/tifs \
-      --target_dir /path/to/hdf5/output
-
----
-
-# WildfireSpreadTS: A dataset of multi-modal time series for wildfire spread prediction
-
-This repository contains the code for recreating the experiments in the WildfireSpreadTS paper. 
-
-- [Link to main paper](https://openreview.net/pdf?id=RgdGkPRQ03)
-- [Link to supplementary material](https://openreview.net/attachment?id=RgdGkPRQ03&name=supplementary_material)
-
-## Updates 
-- After publishing the paper, we discovered a bug in the dataset class. Based on initial experiments, the corrected dataset class leads to slightly higher performance, but the trends in the results are basically the same as those reported in the paper. The bug was fixed in commit `ab3c8f35c5ec8c52c306a4488eaeb71a5a13d0de`, in case you want to roll-back the change to compare with the results in the paper.
-
-- **Feb 2026:** An observant researcher, who kindly reached out to me, pointed out that when dealing with angle features, the current code only transforms the features via sin, but should use both sin and cos, to not lose information. This happens [here](https://github.com/SebastianGer/WildfireSpreadTS/blob/main/src/dataloader/FireSpreadDataset.py#L339). I'm currently too occupied with deadlines in other projects to make sure that nothing breaks when I fix this, so if you're working with these features, be aware of this issue. 
+For results, analysis, and notes: *link to full paper*
 
 
-## Setup the environment
+## Models
 
-``` pip3 install -r requirements.txt ```
+Four baselines and two custom models, all trained on the same data splits.
 
-## Preparing the dataset
+| Model | Kind | Implementation | How to run |
+| --- | --- | --- | --- |
+| Logistic Regression | baseline | `src/baselines/LogisticRegression.py` | `cfgs/LogisticRegression/full_run.yaml` |
+| ResNet18 U-Net | baseline | `src/baselines/SMPModel.py` | `cfgs/unet/res18_monotemporal.yaml` |
+| ConvLSTM | baseline | `src/baselines/ConvLSTMLightning.py` | `cfgs/convlstm/full_run.yaml` |
+| UTAE | baseline | `src/baselines/UTAELightning.py` | `cfgs/UTAE/all_features.yaml` |
+| BCE U-Net | custom | `src/custom_models/unet_bce.py` | `--model unet_bce` |
+| Flow Matching | custom | `src/custom_models/flow_matching.py` | `--model flow` |
 
-The dataset is freely available at [https://doi.org/10.5281/zenodo.8006177](https://doi.org/10.5281/zenodo.8006177) under CC-BY-4.0. For training, you will need to convert them to HDF5 files, which take up twice as much space but allow for much faster training.
+The four baselines are PyTorch Lightning modules driven by YAML configs through
+`src/train.py`. BCE U-Net and Flow Matching live under `src/custom_models/` and
+run through `src/train_custom.py`. BCE U-Net is a discriminative segmentation
+model trained with a positive-weighted binary cross-entropy objective; Flow
+Matching is the one generative architecture in the set.
 
-To convert the dataset to HDF5, run:
-```python3 src/preprocess/CreateHDF5Dataset.py --data_dir YOUR_DATA_DIR --target_dir YOUR_TARGET_DIR```
- substituting the path to your local dataset and where you want the HDF5 version of the dataset to be created. 
+## Data
 
-You can skip this step, and simply pass `--data.load_from_hdf5=False` on the command line, but be aware that you won't be able to perform training at any reasonable speed. 
+[WildfireSpreadTS](https://doi.org/10.5281/zenodo.8006177): 13,607 daily images
+across 607 U.S. fire events, January 2018 to October 2021, at 375 m resolution
+over 23 channels. Train and validate on 2018–2020, test on the held-out 2021
+season, using 128×128 crops.
 
-## Re-running the baseline experiments
+Two input configurations isolate architecture from input data:
 
-We use wandb to log experimental results. This can be turned off by setting the environment variable `WANDB_MODE=disabled`. The results will then be logged to a local directory instead.
+| Configuration | Channels | Feature indices |
+| --- | --- | --- |
+| Vegetation | 7 | `[0, 1, 2, 3, 4, 38, 39]` (vegetation indices + active fire) |
+| All | 23 | all channels (`features_to_keep: null`) |
 
-Experiments are parameterized via yaml files in the `cfgs` directory. Arguments are parsed via the [LightningCLI](https://lightning.ai/docs/pytorch/stable/cli/lightning_cli.html).
+### Preparing the dataset
 
-Grid searches and repetitions of experiments were done via WandB sweeps. Those are parameterized via yaml files in the `cfgs` directory prefixed with `wandb_`. For example, to run the experiments that Table 3 in the main paper is based on, you can run a wandb sweep with `cfgs/unet/wandb_table3.yaml`. For explanations on how to use wandb sweeps please refer to the [original documentation](https://docs.wandb.ai/guides/sweeps). To run the same experiments without WandB, the parameters specified in the WandB sweep configuration file can simply be passed via the command line. 
+Download from [Zenodo](https://doi.org/10.5281/zenodo.8006177) (CC-BY-4.0),
+then convert the GeoTIFFs to HDF5. HDF5 takes about twice the disk space but is
+far faster to train from:
 
-For example, to train the U-net architecture on one day of observations, you could pass arguments on the command line as follows:
+```bash
+python src/preprocess/CreateHDF5Dataset.py --data_dir YOUR_DATA_DIR --target_dir YOUR_TARGET_DIR
+```
+
+You can skip conversion with `--data.load_from_hdf5=False`, but training will
+be impractically slow.
+
+If your HDF5 files sit on a network or cloud-synced mount, build an index once
+so dataset setup does not have to stat every file:
+
+```bash
+python src/preprocess/BuildHDF5Index.py --data_dir YOUR_HDF5_DIR
+```
+
+Files on Google Drive or OneDrive mounts are copied to local disk on first read
+(`src/dataloader/hdf5_cache.py`), because those filesystems cannot serve HDF5
+random reads reliably. Override the cache location with `HDF5_CACHE_DIR` or
+disable it with `HDF5_CACHE_DISABLE=1`.
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+On Google Colab use `requirements-colab.txt`, which installs only what the
+Colab runtime is missing, and see `colab_train.ipynb`.
+
+## Running the experiments
+
+Run everything from the repository root; both entry points import relative to
+`src/`.
+
+### Baseline models
+
+Runs are assembled from three configs — model, trainer, and data. Command-line
+arguments override config files, and later arguments override earlier ones.
+
+```bash
+python src/train.py \
+  --config=cfgs/convlstm/full_run.yaml \
+  --trainer=cfgs/trainer_single_gpu.yaml \
+  --data=cfgs/data_multitemporal_full_features.yaml \
+  --data.data_dir=YOUR_HDF5_DIR \
+  --seed_everything=0 \
+  --do_test=True
+```
+
+Select the feature configuration with `--data.features_to_keep`:
+
+```bash
+# Vegetation (7 channels)
+--data.features_to_keep="[0, 1, 2, 3, 4, 38, 39]"
+
+# All (23 channels)
+--data.features_to_keep=null
+```
+
+Logistic Regression and ResNet18 U-Net use
+`cfgs/data_monotemporal_full_features.yaml`; ConvLSTM and UTAE use
+`cfgs/data_multitemporal_full_features.yaml`.
+
+With `--do_test=True`, testing is followed automatically by a unified-eval pass
+and a prediction visualization, so these results land in the same metric tables
+and W&B panels as BCE U-Net and Flow Matching.
+
+### Custom models
+
+```bash
+python src/train_custom.py \
+  --model [unet_bce|flow] \
+  --data_dir YOUR_HDF5_DIR \
+  --ckpt_dir YOUR_CKPT_DIR \
+  --feature_set [vegetation|all] \
+  --epochs 100 \
+  --eval_every 10
+```
+
+## Evaluation
+
+`src/evaluation/unified_eval.py` is the single source of truth for every number
+in the results table. All six models pass through the same metric code, the
+same thresholds, and the same test data, which is what makes the cross-model
+comparison meaningful.
+
+It computes AP, F1, IoU, precision, and recall, with the threshold metrics at
+0.5. Reporting all five together is the point: AP alone hides the
+over-prediction that makes a high-AP model unusable for drawing an operational
+boundary.
+
+Metrics accumulate incrementally through `torchmetrics` rather than by
+concatenating every pixel score across the test set, so memory stays bounded on
+the full 2021 season.
+
+Two entry points:
+
+- `evaluate_lightning_module()` for baseline models. It calls each model's own
+  `get_pred_and_gt`, so temporal flattening, day-of-year features, and tiled
+  inference match the training-time path exactly.
+- `evaluate_model()` for anything else. Pass a `predict_fn(x0) -> probability
+  map` callable and it computes the identical metrics.
+  `evaluate_bce_unet()` and `evaluate_flow()` are thin wrappers around it.
+
+Standalone prediction maps (UTAE and ConvLSTM checkpoints) are produced with
+`src/evaluation/visualize_predictions.py`. Baseline training also writes a
+prediction grid at the end of `--do_test=True` via
+`src/baselines/visualize_predictions.py`.
+
+## Repository layout
 
 ```
-python3 train.py --config=cfgs/unet/res18_monotemporal.yaml --trainer=cfgs/trainer_single_gpu.yaml --data=cfgs/data_monotemporal_full_features.yaml --seed_everything=0 --trainer.max_epochs=200 --do_test=True --data.data_dir YOUR_DATA_DIR
+cfgs/                       Model, trainer, data, and sweep configs
+src/train.py                LightningCLI entry point for baseline models
+src/train_custom.py         Entry point for BCE U-Net and Flow Matching
+src/dataloader/             FireSpreadDataset, datamodule, HDF5 caching/indexing
+src/baselines/              Logistic Regression, ResNet18 U-Net, ConvLSTM, UTAE
+src/custom_models/          BCE U-Net and Flow Matching
+src/evaluation/             Unified metric harness, eval callback, standalone visualization
+src/preprocess/             GeoTIFF -> HDF5 conversion and indexing
+
 ```
-where you replace `YOUR_DATA_DIR` with the path to your local HDF5 dataset. Alternatively, you can permanently set the data directory in the respective data config files. Parameters defined in config files are overwritten by command-line arguments. Later arguments overwrite previously given arguments. 
 
-## Re-creating the dataset
+## Logging
 
-The code to create the dataset using Google Earth Engine is available at [https://github.com/SebastianGer/WildfireSpreadTSCreateDataset](https://github.com/SebastianGer/WildfireSpreadTSCreateDataset).
+Results are logged to Weights & Biases, defaulting to project
+`WildfireSpreadBench` and entity `ram-algoverse`. Both are set with
+`os.environ.setdefault`, so exporting `WANDB_PROJECT` or `WANDB_ENTITY`
+overrides them without editing code. Set `WANDB_MODE=disabled` to turn logging
+off entirely and write results locally.
 
+For a machine-local setup, copy `cfgs/trainer_local.example.yaml` to
+`cfgs/trainer_local.yaml` (gitignored) and point the checkpoint `dirpath` at
+fast local disk. Do not write checkpoints into a cloud-synced folder; partial
+syncs corrupt them.
 
-## Using the dataset for your own experiments
+The `cfgs/**/wandb_*.yaml` files are W&B sweep configurations covering the
+cross-validation folds and feature-set ablations inherited from
+WildfireSpreadTS. Run one with `wandb sweep cfgs/unet/wandb_table3.yaml`.
 
-To use the dataset outside of the baseline experiments, you can use the Lightning Datamodule at `src/dataloader/FireSpreadDataModule.py` which directly provides dataset loaders for train/val/test set. Alternatively, you can use the PyTorch dataset at `src/dataloader/FireSpreadDataset.py`. 
+## Relationship to WildfireSpreadTS
+
+This repository is a derivative of
+[SebastianGer/WildfireSpreadTS](https://github.com/SebastianGer/WildfireSpreadTS)
+(MIT), the code released with the WildfireSpreadTS dataset. The dataset classes,
+the datamodule, and the Logistic Regression, ResNet18 U-Net, ConvLSTM, and UTAE
+baselines originate there. `src/baselines/utae_paps_models/` is in turn an
+attributed copy from [utae-paps](https://github.com/VSainteuf/utae-paps) (MIT).
+
+Added for this work:
+
+- `src/custom_models/` and `src/train_custom.py` — BCE U-Net and Flow Matching.
+- `src/evaluation/` — the unified metric harness that makes all six models
+  comparable, an in-training eval callback, and standalone prediction
+  visualization.
+- `src/dataloader/hdf5_cache.py` and `src/preprocess/BuildHDF5Index.py` — local
+  caching and indexing so training works from cloud-mounted datasets.
+- Checkpoint-resume fixes in `ConvLSTMLightning` and `UTAELightning`, and
+  hyperparameter capture fixes in `BaseModel`, for current PyTorch Lightning.
 
 ## Citation
 
-```
+Please cite the WildfireSpreadTS dataset this benchmark is built on:
+
+```bibtex
 @inproceedings{
     gerard2023wildfirespreadts,
     title={WildfireSpread{TS}: A dataset of multi-modal time series for wildfire spread prediction},
@@ -102,3 +219,7 @@ To use the dataset outside of the baseline experiments, you can use the Lightnin
     url={https://openreview.net/forum?id=RgdGkPRQ03}
 }
 ```
+
+## License
+
+MIT. See `LICENSE` for the full notice, including upstream copyright.

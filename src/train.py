@@ -2,8 +2,9 @@ from pytorch_lightning.utilities import rank_zero_only
 import torch
 from dataloader.FireSpreadDataModule import FireSpreadDataModule
 from pytorch_lightning.cli import LightningCLI
-from models import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
-from models import BaseModel
+from baselines import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
+from baselines import BaseModel
+from evaluation.unified_eval_callback import UnifiedEvalCallback  # noqa
 import wandb
 import os
 
@@ -21,9 +22,9 @@ class MyLightningCLI(LightningCLI):
         parser.link_arguments("model.class_path",
                               "trainer.logger.init_args.name")
         parser.add_argument("--do_train", type=bool,
-                            help="If True: skip training the model.")
+                            help="If True: train the model.")
         parser.add_argument("--do_predict", type=bool,
-                            help="If True: compute predictions.")
+                            help="If True: compute and save predictions.")
         parser.add_argument("--do_test", type=bool,
                             help="If True: compute test metrics.")
         parser.add_argument("--do_validate", type=bool,
@@ -61,9 +62,6 @@ class MyLightningCLI(LightningCLI):
 
     @rank_zero_only
     def wandb_setup(self):
-        if wandb.run is None:
-            return
-
         """
         Save the config used by LightningCLI to disk, then save that file to wandb.
         Using wandb.config adds some strange formating that means we'd have to do some 
@@ -72,6 +70,9 @@ class MyLightningCLI(LightningCLI):
         Also define min and max metrics in wandb, because otherwise it just reports the 
         last known values, which is not what we want.
         """
+        if wandb.run is None:
+            return
+
         config_file_name = os.path.join(wandb.run.dir, "cli_config.yaml")
 
         cfg_string = self.parser.dump(self.config, skip_none=False)
@@ -82,17 +83,19 @@ class MyLightningCLI(LightningCLI):
         wandb.define_metric("val_loss", summary="min")
         wandb.define_metric("train_f1_epoch", summary="max")
         wandb.define_metric("val_f1", summary="max")
+        wandb.define_metric("eval/*", step_metric="epoch")
 
 
 def main():
-    os.environ["WANDB_PROJECT"] = "WildfireSpreadBench"
-    os.environ["WANDB_ENTITY"] = "ram-algoverse"
+    # setdefault so a caller can point runs at their own project/entity without
+    # editing this file.
+    os.environ.setdefault("WANDB_PROJECT", "WildfireSpreadBench")
+    os.environ.setdefault("WANDB_ENTITY", "ram-algoverse")
 
     # LightningCLI automatically creates an argparse parser with required arguments and types,
     # and instantiates the model and datamodule. For this, it's important to import the model and datamodule classes above.
     cli = MyLightningCLI(BaseModel, FireSpreadDataModule, subclass_mode_model=True, save_config_kwargs={
         "overwrite": True}, parser_kwargs={"parser_mode": "yaml"}, run=False)
-    cli.wandb_setup()
 
     if cli.config.do_train:
         cli.trainer.fit(cli.model, cli.datamodule,
@@ -123,7 +126,7 @@ def main():
             model_name=model_name,
             wandb_log=True,
         )
-        from models.visualize_predictions import run_visualization
+        from baselines.visualize_predictions import run_visualization
         run_visualization(
             model=cli.model,
             datamodule=cli.datamodule,
@@ -132,6 +135,7 @@ def main():
             n_samples=8,
             wandb_log=True,
         )
+
     if cli.config.do_predict:
 
         # Produce predictions, save them in a single file, including ground truth fire targets and input fire masks.
@@ -145,8 +149,9 @@ def main():
         fire_masks_combined = torch.cat(
             [x_af.unsqueeze(0), y_hat.unsqueeze(0), y.unsqueeze(0)], axis=0)
 
+        run_id = wandb.run.id if wandb.run is not None else "local"
         predictions_file_name = os.path.join(
-            cli.config.trainer.default_root_dir, f"predictions_{wandb.run.id}.pt")
+            cli.config.trainer.default_root_dir, f"predictions_{run_id}.pt")
         torch.save(fire_masks_combined, predictions_file_name)
 
 

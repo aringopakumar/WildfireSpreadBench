@@ -11,10 +11,16 @@ logger:
     project: wildfire-spread-bench
     log_model: true
 callbacks: 
+  # Checkpoints are written to Google Drive (explicit dirpath) so they survive
+  # Colab disconnects. save_last keeps a deterministic last.ckpt for resuming.
   - class_path: pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint
     init_args:
+      dirpath: /content/drive/MyDrive/wildfire_runs/checkpoints
+      filename: "{epoch}-{val_loss:.4f}"
       monitor: val_loss
       mode: min
+      save_top_k: 1
+      save_last: true
   - class_path: evaluation.unified_eval_callback.UnifiedEvalCallback
     init_args:
       eval_every_n_epochs: 10
@@ -50,4 +56,5 @@ barebones: false
 plugins: null
 sync_batchnorm: false
 reload_dataloaders_every_n_epochs: 0
+# W&B local run files live here (ephemeral); they sync to the cloud regardless.
 default_root_dir: ./lightning_logs

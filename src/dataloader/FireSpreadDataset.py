@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import glob
 import warnings
+from .hdf5_cache import cached_hdf5_path, load_hdf5_index, n_timesteps_from_index
 from .utils import get_means_stds_missing_values, get_indices_of_degree_features
 import torchvision.transforms.functional as TF
 import h5py
@@ -64,6 +65,7 @@ class FireSpreadDataset(Dataset):
         # Create an inventory of all images in the dataset, and how many data points each fire contains. Since we have multiple data points per fire,
         # we need to know how many data points each fire contains, to be able to map a dataset index to a specific fire.
         self.imgs_per_fire = self.read_list_of_images()
+        self.hdf5_index = load_hdf5_index(self.data_dir) if self.load_from_hdf5 else None
         self.datapoints_per_fire = self.compute_datapoints_per_fire()
         self.length = sum([sum(self.datapoints_per_fire[fire_year].values())
                           for fire_year in self.datapoints_per_fire])
@@ -136,7 +138,9 @@ class FireSpreadDataset(Dataset):
         end_index = (in_fire_index + self.n_leading_observations + 1)
 
         if self.load_from_hdf5:
-            hdf5_path = self.imgs_per_fire[found_fire_year][found_fire_name][0]
+            hdf5_path = cached_hdf5_path(
+                self.imgs_per_fire[found_fire_year][found_fire_name][0]
+            )
             with h5py.File(hdf5_path, 'r') as f:
                 imgs = f["data"][in_fire_index:end_index]
                 if self.return_doy:
@@ -257,11 +261,19 @@ class FireSpreadDataset(Dataset):
                 if not self.load_from_hdf5:
                     n_fire_imgs = len(fire_imgs) - self.skip_initial_samples
                 else:
-                    # Catch error case that there's no file
                     if not fire_imgs:
                         n_fire_imgs = 0
+                    elif self.hdf5_index is not None:
+                        n_timesteps = n_timesteps_from_index(
+                            self.hdf5_index, fire_year, fire_name
+                        )
+                        if n_timesteps is None:
+                            with h5py.File(cached_hdf5_path(fire_imgs[0]), 'r') as f:
+                                n_fire_imgs = len(f["data"]) - self.skip_initial_samples
+                        else:
+                            n_fire_imgs = n_timesteps - self.skip_initial_samples
                     else:
-                        with h5py.File(fire_imgs[0], 'r') as f:
+                        with h5py.File(cached_hdf5_path(fire_imgs[0]), 'r') as f:
                             n_fire_imgs = len(f["data"]) - self.skip_initial_samples
                 # If we have two days of observations, and a lead of one day,
                 # we can only predict the second day's fire mask, based on the first day's observation
