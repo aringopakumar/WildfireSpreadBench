@@ -4,9 +4,6 @@ Code and configurations for a unified benchmark of six architectures on
 next-day wildfire spread prediction, all scored through a single shared
 evaluation pipeline.
 
-For results, analysis, and notes: *link to full paper*
-
-
 ## Models
 
 Four baselines and two custom models, all trained on the same data splits.
@@ -30,8 +27,7 @@ Matching is the one generative architecture in the set.
 
 [WildfireSpreadTS](https://doi.org/10.5281/zenodo.8006177): 13,607 daily images
 across 607 U.S. fire events, January 2018 to October 2021, at 375 m resolution
-over 23 channels. Train and validate on 2018–2020, test on the held-out 2021
-season, using 128×128 crops.
+over 23 channels. We train on the 2018–2019 seasons, validate on 2020, and test on 2021, using 128×128 crops.
 
 Two input configurations isolate architecture from input data:
 
