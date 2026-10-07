@@ -2,7 +2,9 @@
 
 Code and configurations for a unified benchmark of six architectures on
 next-day wildfire spread prediction, all scored through a single shared
-evaluation pipeline.
+evaluation pipeline. 
+
+Full Paper: [WildfireSpreadBench: The Metric Decides the Model in Wildfire Spread Prediction](https://arxiv.org/abs/2609.22191v1)
 
 ## Models
 
